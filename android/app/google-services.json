@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "455844743685",
+    "project_id": "rain-safe-navigator",
+    "storage_bucket": "rain-safe-navigator.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:455844743685:android:64686f6e120fd2fcbfea6c",
+        "android_client_info": {
+          "package_name": "com.example.project_1"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD_nVPALldayMu7Co1LboSi-YalNJqhGgs"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

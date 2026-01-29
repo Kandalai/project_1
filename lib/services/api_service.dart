@@ -13,18 +13,25 @@ import '../utils/error_handler.dart';
 final Map<String, LatLng> _coordinateCache = {};
 final Map<String, List<String>> _suggestionsCache = {};
 final Map<String, dynamic> _weatherCache = {};
+final Map<String, List<double>> _elevationCache = {};
 
 DateTime? _lastNominatimCall;
 
 /// Service for all backend API integration and weather analysis.
-/// Handles route calculation, geocoding, weather forecasting, and hazard reporting.
-/// Uses caching to optimize API calls and reduce rate limiting.
+/// Handles route calculation, geocoding, weather forecasting, hazard reporting,
+/// elevation analysis, and vehicle-specific risk assessment.
+/// 
+/// Enhanced with:
+/// - Weather validation for hazard reports (sensor cross-check)
+/// - ENGLISH FALLBACK for location names
 class ApiService {
   static const String _tag = 'ApiService';
 
   // ==========================================
   // HTTP Headers with Strict English Support
   // ==========================================
+  /// ENGLISH FALLBACK: These headers ensure all API responses default to English,
+  /// making the app usable by tourists and non-local residents.
   static const Map<String, String> _englishHeaders = {
     'User-Agent': 'RainSafeNavigator/2.0',
     'Accept-Language': 'en-US,en;q=0.9',
@@ -57,6 +64,8 @@ class ApiService {
   }
 
   /// Gets suggestions: First checks History, then API.
+  /// 
+  /// ENGLISH FALLBACK: All API responses are in English for accessibility.
   Future<List<String>> getPlaceSuggestions(String query) async {
     final List<String> results = [];
 
@@ -93,6 +102,9 @@ class ApiService {
     }
   }
 
+  /// Fetches place suggestions from Nominatim API.
+  /// 
+  /// ENGLISH FALLBACK: Uses English headers to ensure results are readable.
   Future<List<String>> _fetchNominatimSuggestions(String query) async {
     try {
       final url = Uri.parse(
@@ -153,6 +165,9 @@ class ApiService {
   }
 
   /// Get continuous position stream for live tracking.
+  /// 
+  /// THERMAL/BATTERY GUARD: Distance filter can be adjusted dynamically
+  /// to reduce battery drain and heat on long straightaways.
   Stream<LatLng> getPositionStream({
     LocationAccuracy accuracy = LocationAccuracy.bestForNavigation,
     int distanceFilter = 10,
@@ -174,6 +189,8 @@ class ApiService {
   // ==========================================
 
   /// Convert address string to coordinates.
+  /// 
+  /// ENGLISH FALLBACK: Searches with English language preference.
   Future<LatLng?> getCoordinates(String cityName) async {
     if (!_isValidLocationString(cityName)) return null;
 
@@ -205,6 +222,9 @@ class ApiService {
     }
   }
 
+  /// Searches Nominatim API for coordinates.
+  /// 
+  /// ENGLISH FALLBACK: Uses English headers for consistent results.
   Future<LatLng?> _searchNominatim(String query) async {
     try {
       if (_coordinateCache.containsKey(query)) {
@@ -243,6 +263,7 @@ class ApiService {
     return null;
   }
 
+  /// Enforces rate limiting for Nominatim API calls.
   Future<void> _rateLimitNominatim() async {
     if (_lastNominatimCall != null) {
       final diff =
@@ -254,35 +275,211 @@ class ApiService {
   }
 
   // ==========================================
-  // 4. MULTI-ROUTE & SAFE ROUTE LOGIC
+  // 4. ELEVATION ANALYSIS ("Dip" Predictor)
   // ==========================================
 
-  /// Get multiple routes with weather analysis and safety scoring.
-  Future<List<RouteModel>> getSafeRoutesOptions(
-      LatLng start, LatLng end) async {
+  /// Get elevation data for a list of points using Open-Elevation API.
+  Future<List<double>> getElevationData(List<LatLng> points) async {
     try {
-      // 1. Get multiple geometries from OSRM
-      final List<RouteModel> rawRoutes =
-          await _getOsrmRoutesWithAlternatives(start, end);
+      // Sample points to reduce API calls (max 100 points per request)
+      final sampledPoints = _sampleRoutePoints(points, samples: 50);
+      
+      final cacheKey = sampledPoints.map((p) => '${p.latitude.toStringAsFixed(3)},${p.longitude.toStringAsFixed(3)}').join('|');
+      
+      if (_elevationCache.containsKey(cacheKey)) {
+        return _elevationCache[cacheKey]!;
+      }
+
+      // Build request body
+      final locations = sampledPoints.map((p) => {
+        'latitude': p.latitude,
+        'longitude': p.longitude,
+      }).toList();
+
+      final url = Uri.parse('https://api.open-elevation.com/api/v1/lookup');
+      
+      final response = await http.post(
+        url,
+        headers: {'Content-Type': 'application/json'},
+        body: json.encode({'locations': locations}),
+      ).timeout(const Duration(seconds: 15));
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body) as Map<String, dynamic>;
+        final results = (data['results'] as List<dynamic>?) ?? [];
+        
+        final elevations = results.map((e) => ((e as Map<String, dynamic>)['elevation'] as num).toDouble()).toList();
+        
+        _elevationCache[cacheKey] = elevations;
+        return elevations;
+      }
+    } catch (e) {
+      ErrorHandler.logError(_tag, 'Elevation API error: $e');
+    }
+    return [];
+  }
+
+  /// Detect elevation dips along the route (potential waterlogging zones).
+  Future<List<ElevationDip>> detectElevationDips(List<LatLng> routePoints) async {
+    try {
+      final elevations = await getElevationData(routePoints);
+      
+      if (elevations.length < 3) return [];
+
+      final List<ElevationDip> dips = [];
+      final sampledPoints = _sampleRoutePoints(routePoints, samples: elevations.length);
+
+      // Sliding window to detect local minima
+      for (int i = 1; i < elevations.length - 1; i++) {
+        final current = elevations[i];
+        final prev = elevations[i - 1];
+        final next = elevations[i + 1];
+
+        // Check if current point is lower than both neighbors
+        if (current < prev && current < next) {
+          final drop = ((prev + next) / 2) - current;
+          
+          // Flag as dip if drop is > 5 meters
+          if (drop >= 5.0) {
+            const distanceCalc = Distance();
+            final distFromStart = distanceCalc.as(
+              LengthUnit.Meter,
+              routePoints.first,
+              sampledPoints[i],
+            );
+
+            dips.add(ElevationDip(
+              point: sampledPoints[i],
+              depthMeters: drop,
+              isHighRisk: drop >= 10.0, // Critical dip
+              distanceFromStart: distFromStart,
+            ));
+          }
+        }
+      }
+
+      return dips;
+    } catch (e) {
+      ErrorHandler.logError(_tag, 'Dip detection error: $e');
+      return [];
+    }
+  }
+
+  // ==========================================
+  // 5. WEATHER API ENDPOINTS
+  // ==========================================
+
+  /// Gets current weather at a specific location.
+  /// 
+  /// SENSOR CROSS-CHECK: Used to validate hazard reports against real weather data.
+  /// Returns weather code, temperature, and rain intensity.
+  Future<Map<String, dynamic>?> getWeatherAtLocation(LatLng location) async {
+    try {
+      final url = Uri.parse(
+          'https://api.open-meteo.com/v1/forecast?latitude=${location.latitude}&longitude=${location.longitude}&current_weather=true&hourly=weathercode,temperature_2m,rain&timezone=auto');
+
+      final response = await http.get(url, headers: _englishHeaders).timeout(
+            const Duration(seconds: 10),
+          );
+
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body) as Map<String, dynamic>;
+        final currentWeather = data['current_weather'] as Map<String, dynamic>?;
+        final hourly = data['hourly'] as Map<String, dynamic>?;
+
+        if (currentWeather == null || hourly == null) return null;
+
+        // Get current hour's rain data
+        final now = DateTime.now();
+        final times = hourly['time'] as List<dynamic>? ?? [];
+        final rains = hourly['rain'] as List<dynamic>? ?? [];
+        
+        double currentRain = 0.0;
+        final currentHourStr = now.toIso8601String().substring(0, 13);
+        
+        for (int i = 0; i < times.length; i++) {
+          if (times[i].toString().startsWith(currentHourStr)) {
+            currentRain = (rains[i] as num?)?.toDouble() ?? 0.0;
+            break;
+          }
+        }
+
+        return {
+          'weathercode': currentWeather['weathercode'] as int,
+          'temperature_2m': currentWeather['temperature'] as double,
+          'rain': currentRain,
+        };
+      }
+    } catch (e) {
+      ErrorHandler.logError(_tag, 'Weather API error: $e');
+    }
+    return null;
+  }
+
+  // ==========================================
+  // 6. VEHICLE-SPECIFIC ROUTE LOGIC
+  // ==========================================
+
+  /// Get multiple routes with vehicle-specific analysis.
+  Future<List<RouteModel>> getSafeRoutesOptions(
+    LatLng start,
+    LatLng end, {
+    VehicleType vehicleType = VehicleType.bike,
+  }) async {
+    try {
+      // 1. Check for ocean barriers
+      const Distance distanceCalc = Distance();
+      final airDistance = distanceCalc.as(LengthUnit.Kilometer, start, end);
+
+      if (airDistance > 2000) {
+        throw Exception('Ocean/Continental barrier detected. Road route unavailable.');
+      }
+
+      // 2. Get multiple geometries from OSRM
+      final List<RouteModel> rawRoutes = await _getOsrmRoutesWithAlternatives(start, end);
 
       if (rawRoutes.isEmpty) {
         throw Exception('No routes found from OSRM');
       }
 
-      // 2. Analyze weather for EACH route
+      // 3. Analyze each route
       final List<RouteModel> analyzedRoutes = [];
+      
       for (final route in rawRoutes) {
-        final analyzed = await _analyzeRouteWeather(route);
+        // Weather analysis
+        final RouteModel withWeather = await _analyzeRouteWeather(route, vehicleType);
+        
+        // Elevation analysis (detect dips)
+        final dips = await detectElevationDips(route.points);
+        
+        // Vehicle-specific checks
+        bool hydroplaning = false;
+        if (vehicleType == VehicleType.truck || vehicleType == VehicleType.car) {
+          // Check for high-speed segments in rain
+          if (withWeather.isRaining && route.distanceMeters > 5000) {
+            hydroplaning = true;
+          }
+        }
+
+        // Combine all analysis
+        final analyzed = withWeather.copyWithWeather(
+          isRaining: withWeather.isRaining,
+          riskLevel: _calculateVehicleRisk(withWeather, vehicleType, dips),
+          weatherAlerts: withWeather.weatherAlerts,
+          elevationDips: dips,
+          hydroplaningRisk: hydroplaning,
+        );
+
         analyzedRoutes.add(analyzed);
       }
 
-      // 3. SORT: Prioritize Safety, then Speed
+      // 4. SORT: Prioritize Safety, then Speed
       analyzedRoutes.sort((a, b) {
         final aSafe = a.riskLevel == 'Safe';
         final bSafe = b.riskLevel == 'Safe';
 
-        if (aSafe && !bSafe) return -1; // A comes first
-        if (!aSafe && bSafe) return 1; // B comes first
+        if (aSafe && !bSafe) return -1;
+        if (!aSafe && bSafe) return 1;
         return a.durationSeconds.compareTo(b.durationSeconds);
       });
 
@@ -293,6 +490,46 @@ class ApiService {
     }
   }
 
+  /// Calculates vehicle-specific risk level based on weather, dips, and road conditions.
+  String _calculateVehicleRisk(
+    RouteModel route,
+    VehicleType vehicleType,
+    List<ElevationDip> dips,
+  ) {
+    // Check dips first
+    final criticalDips = dips.where((d) => d.isHighRisk).toList();
+    
+    if (route.isRaining && criticalDips.isNotEmpty) {
+      return 'High'; // Rain + Dips = Waterlogging risk
+    }
+
+    // Vehicle-specific rain thresholds
+    if (route.isRaining) {
+      // Check if rain exceeds vehicle threshold
+      final maxRainIntensity = route.weatherAlerts
+          .map((a) => a.rainIntensity ?? 0)
+          .fold(0.0, (a, b) => a > b ? a : b);
+
+      if (maxRainIntensity >= vehicleType.rainThreshold) {
+        return 'High';
+      } else if (maxRainIntensity > vehicleType.rainThreshold * 0.5) {
+        return 'Medium';
+      }
+    }
+
+    // Truck-specific checks
+    if (vehicleType == VehicleType.truck) {
+      if (route.hasUnpavedRoads && route.isRaining) {
+        return 'High'; // Soft ground risk
+      }
+    }
+
+    return 'Safe';
+  }
+
+  /// Gets multiple route alternatives from OSRM API.
+  /// 
+  /// POLYLINE SNAP FIX: Routes use exact OSRM geometry to prevent GPS offset.
   Future<List<RouteModel>> _getOsrmRoutesWithAlternatives(
     LatLng start,
     LatLng end,
@@ -327,8 +564,11 @@ class ApiService {
     }
   }
 
-  /// Analyze route for weather hazards.
-  Future<RouteModel> _analyzeRouteWeather(RouteModel route) async {
+  /// Analyze route for weather hazards with vehicle-specific thresholds.
+  Future<RouteModel> _analyzeRouteWeather(
+    RouteModel route,
+    VehicleType vehicleType,
+  ) async {
     try {
       final checkPoints = _sampleRoutePoints(route.points, samples: 8);
       var rainDetected = false;
@@ -346,6 +586,7 @@ class ApiService {
 
         if (weather != null) {
           final code = weather['weathercode'] as int? ?? 0;
+          final rainIntensity = weather['rain'] as double? ?? 0.0;
 
           if (_isRainyCode(code)) {
             rainDetected = true;
@@ -358,6 +599,7 @@ class ApiService {
                     (weather['temperature_2m'] as num?)?.toDouble() ?? 0.0,
                 time:
                     '${arrivalTime.hour}:${arrivalTime.minute.toString().padLeft(2, '0')}',
+                rainIntensity: rainIntensity,
               ),
             );
           }
@@ -372,7 +614,6 @@ class ApiService {
       );
     } catch (e) {
       ErrorHandler.logError(_tag, '_analyzeRouteWeather error: $e');
-      // Return with Unknown risk on error
       return route.copyWithWeather(
         isRaining: false,
         riskLevel: 'Unknown',
@@ -381,6 +622,7 @@ class ApiService {
     }
   }
 
+  /// Samples route points to reduce API calls.
   List<LatLng> _sampleRoutePoints(List<LatLng> path, {int samples = 5}) {
     if (path.isEmpty) return [];
     if (path.length <= samples) return path;
@@ -414,7 +656,7 @@ class ApiService {
       await Future.delayed(const Duration(milliseconds: 150));
 
       final url = Uri.parse(
-          'https://api.open-meteo.com/v1/forecast?latitude=${point.latitude}&longitude=${point.longitude}&hourly=weathercode,temperature_2m&timezone=auto');
+          'https://api.open-meteo.com/v1/forecast?latitude=${point.latitude}&longitude=${point.longitude}&hourly=weathercode,temperature_2m,rain&timezone=auto');
 
       final response = await http.get(url, headers: _englishHeaders).timeout(
             const Duration(seconds: 10),
@@ -444,6 +686,7 @@ class ApiService {
           'temperature_2m':
               ((hourly?['temperature_2m'] as List<dynamic>?)?[targetIndex] ??
                   0.0) as double,
+          'rain': ((hourly?['rain'] as List<dynamic>?)?[targetIndex] ?? 0.0) as double,
         };
 
         _weatherCache[key] = result;
@@ -463,6 +706,8 @@ class ApiService {
   }
 
   /// Get human-readable weather description from WMO code.
+  /// 
+  /// ENGLISH FALLBACK: All descriptions are in English for accessibility.
   String getWeatherDescription(int weatherCode) {
     if (weatherCode == 0) return 'Clear sky';
     if (weatherCode >= 1 && weatherCode <= 3) return 'Cloudy';
@@ -479,10 +724,10 @@ class ApiService {
   }
 
   // ==========================================
-  // 5. INPUT VALIDATION (GROUND STANDARDS)
+  // 7. INPUT VALIDATION
   // ==========================================
 
-  /// Validate location input against problematic terms.
+  /// Validates if a string is a valid location input.
   bool _isValidLocationString(String? input) {
     if (input == null || input.trim().isEmpty) return false;
 

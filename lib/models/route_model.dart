@@ -1,247 +1,462 @@
 import 'package:latlong2/latlong.dart';
 
-/// Represents a single turn-by-turn navigation instruction.
-class NavigationStep {
-  /// The instruction text for this navigation step (e.g., "Turn left on Main St").
-  final String instruction;
+// ==========================================
+// VEHICLE TYPES
+// ==========================================
 
-  /// The type of maneuver (e.g., "turn", "straight", "merge").
-  final String maneuverType;
+/// Vehicle types with specific risk thresholds for rain.
+enum VehicleType {
+  /// Motorcycle/bike vehicle type
+  bike,
+  
+  /// Car vehicle type
+  car,
+  
+  /// Truck vehicle type
+  truck,
+  
+  /// Bus vehicle type
+  bus;
 
-  /// The distance for this step in meters.
-  final double distance;
-
-  /// The location of the maneuver in [longitude, latitude] format.
-  final List<double> location; // [longitude, latitude]
-
-  /// Creates a [NavigationStep].
-  const NavigationStep({
-    required this.instruction,
-    required this.maneuverType,
-    required this.distance,
-    required this.location,
-  });
-
-  /// Safely parse a route step from OSRM JSON response.
-  factory NavigationStep.fromJson(Map<String, dynamic> json) {
-    return NavigationStep(
-      instruction: (json['instruction']?.toString()) ?? 'Continue',
-      maneuverType:
-          (json['maneuver'] as Map<String, dynamic>?)?['type']?.toString() ??
-              'straight',
-      distance: (json['distance'] as num?)?.toDouble() ?? 0.0,
-      location: _parseLocation(
-          (json['maneuver'] as Map<String, dynamic>?)?['location']),
-    );
+  /// Icon representation for each vehicle type.
+  String get icon {
+    switch (this) {
+      case VehicleType.bike:
+        return '🏍️';
+      case VehicleType.car:
+        return '🚗';
+      case VehicleType.truck:
+        return '🚚';
+      case VehicleType.bus:
+        return '🚌';
+    }
   }
 
-  /// Parse location coordinates safely from JSON.
-  static List<double> _parseLocation(dynamic location) {
-    if (location is List && location.length >= 2) {
-      return [
-        (location[0] as num?)?.toDouble() ?? 0.0,
-        (location[1] as num?)?.toDouble() ?? 0.0,
-      ];
+  /// Display name for the vehicle type.
+  String get displayName {
+    switch (this) {
+      case VehicleType.bike:
+        return 'Bike';
+      case VehicleType.car:
+        return 'Car';
+      case VehicleType.truck:
+        return 'Truck';
+      case VehicleType.bus:
+        return 'Bus';
     }
-    return [0.0, 0.0];
+  }
+
+  /// Rain threshold in mm/hr for each vehicle type.
+  /// Bikes are most vulnerable, trucks/buses more resilient.
+  double get rainThreshold {
+    switch (this) {
+      case VehicleType.bike:
+        return 5.0; // High sensitivity for two-wheelers
+      case VehicleType.car:
+        return 15.0; // Lower sensitivity
+      case VehicleType.truck:
+        return 10.0;
+      case VehicleType.bus:
+        return 12.0;
+    }
   }
 }
 
-/// Represents weather information for a specific location and time.
+// ==========================================
+// GPS POLLING CONFIGURATION
+// ==========================================
+
+/// GPS polling configuration for thermal/battery optimization.
+class GPSPollingConfig {
+  /// Get optimal distance filter based on navigation state.
+  /// 
+  /// THERMAL/BATTERY GUARD: Reduces GPS polling on straightaways to prevent overheating.
+  static int getDistanceFilter({
+    required bool isNavigating,
+    required bool isStraightaway,
+    required bool isInCity,
+  }) {
+    if (!isNavigating) return 10; // Normal tracking
+    if (isStraightaway) return 50; // On straightaway, save battery
+    if (isInCity) return 5; // High accuracy in city
+    return 10; // Default
+  }
+}
+
+// ==========================================
+// HAZARD STATUS & REPORTING
+// ==========================================
+
+/// Status of a hazard report in the verification lifecycle.
+enum HazardStatus {
+  /// Awaiting verification
+  pending,
+  
+  /// Confirmed by 3+ users
+  verified,
+  
+  /// Flagged as false
+  rejected,
+  
+  /// Time-to-live expired
+  expired;
+}
+
+/// Hazard report with trust scoring and verification.
+/// 
+/// ANTI-PRANKSTER FILTER: Includes trust score and sensor cross-check validation.
+class HazardReport {
+  /// The geographical location of the hazard.
+  final LatLng location;
+
+  /// The type of hazard (e.g., "Waterlogging", "Accident", "Road Block").
+  final String hazardType;
+
+  /// The timestamp when the report was created.
+  final DateTime timestamp;
+
+  /// Trust score (0.0 to 1.0) based on sensor cross-check and user history.
+  final double trustScore;
+
+  /// Current verification status.
+  final HazardStatus status;
+
+  /// Number of independent confirmations.
+  final int confirmationCount;
+
+  /// Creates a [HazardReport].
+  HazardReport({
+    required this.location,
+    required this.hazardType,
+    required this.timestamp,
+    this.trustScore = 0.5,
+    this.status = HazardStatus.pending,
+    this.confirmationCount = 0,
+  });
+
+  /// Convert to JSON for Firestore storage.
+  Map<String, dynamic> toJson() {
+    return {
+      'location': {
+        'latitude': location.latitude,
+        'longitude': location.longitude,
+      },
+      'hazardType': hazardType,
+      'timestamp': timestamp.toIso8601String(),
+      'trustScore': trustScore,
+      'status': status.toString().split('.').last,
+      'confirmationCount': confirmationCount,
+      'expiresAt': timestamp.add(const Duration(hours: 4)).toIso8601String(),
+    };
+  }
+
+  /// Create from Firestore document.
+  factory HazardReport.fromJson(Map<String, dynamic> json) {
+    final location = json['location'] as Map<String, dynamic>?;
+    return HazardReport(
+      location: LatLng(
+        (location?['latitude'] as num?)?.toDouble() ?? 0.0,
+        (location?['longitude'] as num?)?.toDouble() ?? 0.0,
+      ),
+      hazardType: (json['hazardType'] as String?) ?? 'Unknown',
+      timestamp: DateTime.tryParse((json['timestamp'] as String?) ?? '') ?? DateTime.now(),
+      trustScore: (json['trustScore'] as num?)?.toDouble() ?? 0.5,
+      status: _parseStatus((json['status'] as String?) ?? 'pending'),
+      confirmationCount: (json['confirmationCount'] as int?) ?? 0,
+    );
+  }
+
+  /// Copy with updated verification status.
+  HazardReport copyWith({
+    double? trustScore,
+    HazardStatus? status,
+    int? confirmationCount,
+  }) {
+    return HazardReport(
+      location: location,
+      hazardType: hazardType,
+      timestamp: timestamp,
+      trustScore: trustScore ?? this.trustScore,
+      status: status ?? this.status,
+      confirmationCount: confirmationCount ?? this.confirmationCount,
+    );
+  }
+
+  /// Parse status string to enum.
+  static HazardStatus _parseStatus(String status) {
+    switch (status.toLowerCase()) {
+      case 'verified':
+        return HazardStatus.verified;
+      case 'rejected':
+        return HazardStatus.rejected;
+      case 'expired':
+        return HazardStatus.expired;
+      default:
+        return HazardStatus.pending;
+    }
+  }
+}
+
+// ==========================================
+// ROUTE MODEL
+// ==========================================
+
+/// Represents a calculated route with weather and elevation analysis.
+class RouteModel {
+  /// List of coordinates forming the route path.
+  final List<LatLng> points;
+
+  /// Turn-by-turn navigation steps.
+  final List<RouteStep> steps;
+
+  /// Weather alerts along the route.
+  final List<WeatherAlert> weatherAlerts;
+
+  /// Elevation dips (potential waterlogging zones).
+  final List<ElevationDip> elevationDips;
+
+  /// Total distance in meters.
+  final double distanceMeters;
+
+  /// Estimated duration in minutes.
+  final int durationMinutes;
+
+  /// Estimated duration in seconds (for precise calculations).
+  final int durationSeconds;
+
+  /// Risk level: "Safe", "Medium", or "High".
+  final String riskLevel;
+
+  /// Whether rain is detected along the route.
+  final bool isRaining;
+
+  /// Hydroplaning risk for high-speed segments in rain.
+  final bool hydroplaningRisk;
+
+  /// Whether route includes unpaved roads.
+  final bool hasUnpavedRoads;
+
+  /// Creates a [RouteModel].
+  RouteModel({
+    required this.points,
+    required this.steps,
+    required this.weatherAlerts,
+    required this.elevationDips,
+    required this.distanceMeters,
+    required this.durationMinutes,
+    required this.durationSeconds,
+    required this.riskLevel,
+    required this.isRaining,
+    required this.hydroplaningRisk,
+    required this.hasUnpavedRoads,
+  });
+
+  /// Create from OSRM API response.
+  factory RouteModel.fromOsrmJson(Map<String, dynamic> json) {
+    final geometry = json['geometry'] as Map<String, dynamic>?;
+    final coordinates = (geometry?['coordinates'] as List<dynamic>?) ?? [];
+
+    final points = coordinates
+        .map((coord) {
+          final coordList = coord as List<dynamic>;
+          return LatLng(
+            (coordList[1] as num).toDouble(),
+            (coordList[0] as num).toDouble(),
+          );
+        })
+        .toList();
+
+    final legs = (json['legs'] as List<dynamic>?) ?? [];
+    final allSteps = <RouteStep>[];
+
+    for (final leg in legs) {
+      final legMap = leg as Map<String, dynamic>;
+      final steps = (legMap['steps'] as List<dynamic>?) ?? [];
+      for (final step in steps) {
+        allSteps.add(RouteStep.fromOsrmJson(step as Map<String, dynamic>));
+      }
+    }
+
+    final distance = (json['distance'] as num?)?.toDouble() ?? 0.0;
+    final duration = (json['duration'] as num?)?.toDouble() ?? 0.0;
+
+    return RouteModel(
+      points: points,
+      steps: allSteps,
+      weatherAlerts: [],
+      elevationDips: [],
+      distanceMeters: distance,
+      durationMinutes: (duration / 60).round(),
+      durationSeconds: duration.round(),
+      riskLevel: 'Unknown',
+      isRaining: false,
+      hydroplaningRisk: false,
+      hasUnpavedRoads: false,
+    );
+  }
+
+  /// Copy with weather analysis results.
+  RouteModel copyWithWeather({
+    bool? isRaining,
+    String? riskLevel,
+    List<WeatherAlert>? weatherAlerts,
+    List<ElevationDip>? elevationDips,
+    bool? hydroplaningRisk,
+    bool? hasUnpavedRoads,
+  }) {
+    return RouteModel(
+      points: points,
+      steps: steps,
+      weatherAlerts: weatherAlerts ?? this.weatherAlerts,
+      elevationDips: elevationDips ?? this.elevationDips,
+      distanceMeters: distanceMeters,
+      durationMinutes: durationMinutes,
+      durationSeconds: durationSeconds,
+      riskLevel: riskLevel ?? this.riskLevel,
+      isRaining: isRaining ?? this.isRaining,
+      hydroplaningRisk: hydroplaningRisk ?? this.hydroplaningRisk,
+      hasUnpavedRoads: hasUnpavedRoads ?? this.hasUnpavedRoads,
+    );
+  }
+
+  /// Snap GPS position to nearest route point.
+  /// 
+  /// POLYLINE SNAP FIX: Prevents GPS "floating" off the road.
+  LatLng snapToRoute(LatLng gpsPosition) {
+    if (points.isEmpty) return gpsPosition;
+
+    LatLng closest = points.first;
+    double minDistance = _calculateDistance(gpsPosition, closest);
+
+    for (final point in points) {
+      final distance = _calculateDistance(gpsPosition, point);
+      if (distance < minDistance) {
+        minDistance = distance;
+        closest = point;
+      }
+    }
+
+    return closest;
+  }
+
+  /// Check if next segment is straight (for GPS polling optimization).
+  /// 
+  /// THERMAL/BATTERY GUARD: Used to adjust GPS polling rate.
+  bool isNextSegmentStraight(int currentStepIndex) {
+    if (currentStepIndex >= steps.length - 1) return false;
+    final step = steps[currentStepIndex];
+    return step.maneuverType.toLowerCase().contains('straight') ||
+           step.maneuverType.toLowerCase().contains('continue');
+  }
+
+  /// Calculate distance between two points in meters.
+  double _calculateDistance(LatLng p1, LatLng p2) {
+    const Distance distance = Distance();
+    return distance.as(LengthUnit.Meter, p1, p2);
+  }
+}
+
+// ==========================================
+// ROUTE STEP
+// ==========================================
+
+/// Represents a single navigation step in a route.
+class RouteStep {
+  /// Human-readable instruction.
+  final String instruction;
+
+  /// Distance in meters for this step.
+  final double distance;
+
+  /// Maneuver type (e.g., "turn", "straight", "arrive").
+  final String maneuverType;
+
+  /// Location [longitude, latitude] where maneuver occurs.
+  final List<double> location;
+
+  /// Creates a [RouteStep].
+  RouteStep({
+    required this.instruction,
+    required this.distance,
+    required this.maneuverType,
+    required this.location,
+  });
+
+  /// Create from OSRM step JSON.
+  factory RouteStep.fromOsrmJson(Map<String, dynamic> json) {
+    final maneuver = json['maneuver'] as Map<String, dynamic>?;
+    final location = (maneuver?['location'] as List<dynamic>?) ?? [0.0, 0.0];
+
+    return RouteStep(
+      instruction: (json['name'] as String?) ?? 'Continue',
+      distance: (json['distance'] as num?)?.toDouble() ?? 0.0,
+      maneuverType: (maneuver?['type'] as String?) ?? 'continue',
+      location: [
+        (location[0] as num).toDouble(),
+        (location[1] as num).toDouble(),
+      ],
+    );
+  }
+}
+
+// ==========================================
+// WEATHER ALERT
+// ==========================================
+
+/// Weather alert for a specific point along the route.
 class WeatherAlert {
-  /// The geographic coordinates of this weather alert.
+  /// Location of the alert.
   final LatLng point;
 
-  /// The WMO weather code indicating the weather condition.
+  /// Weather code from Open-Meteo.
   final int weatherCode;
 
-  /// Human-readable description of the weather condition.
+  /// Human-readable description.
   final String description;
 
-  /// Temperature in degrees Celsius.
+  /// Temperature in Celsius.
   final double temperature;
 
-  /// The time of this weather observation (HH:MM format).
+  /// Time when alert applies (HH:MM format).
   final String time;
 
+  /// Rain intensity in mm/hr.
+  final double? rainIntensity;
+
   /// Creates a [WeatherAlert].
-  const WeatherAlert({
+  WeatherAlert({
     required this.point,
     required this.weatherCode,
     required this.description,
     required this.temperature,
     required this.time,
+    this.rainIntensity,
   });
-
-  /// Parse weather alert from JSON response.
-  factory WeatherAlert.fromJson(Map<String, dynamic> json) {
-    return WeatherAlert(
-      point: json['point'] as LatLng? ?? const LatLng(0, 0),
-      weatherCode: json['code'] as int? ?? 0,
-      description: json['description']?.toString() ?? 'Unknown',
-      temperature: (json['temp'] as num?)?.toDouble() ?? 0.0,
-      time: json['time']?.toString() ?? '00:00',
-    );
-  }
 }
 
-/// Represents a complete route with safety analysis and weather information.
-class RouteModel {
-  /// The ordered list of coordinates that form this route path.
-  final List<LatLng> points;
+// ==========================================
+// ELEVATION DIP
+// ==========================================
 
-  /// The total distance of this route in meters.
-  final double distanceMeters;
+/// Represents an elevation dip (potential waterlogging zone).
+class ElevationDip {
+  /// Location of the dip.
+  final LatLng point;
 
-  /// The estimated travel time for this route in seconds.
-  final double durationSeconds;
+  /// Depth of the dip in meters.
+  final double depthMeters;
 
-  /// The turn-by-turn navigation steps for this route.
-  final List<NavigationStep> steps;
+  /// Whether this is a high-risk dip (>10m drop).
+  final bool isHighRisk;
 
-  /// Whether rain is detected on any part of this route.
-  final bool isRaining;
+  /// Distance from route start in meters.
+  final double distanceFromStart;
 
-  /// The safety level of this route ('Safe', 'Medium', or 'High').
-  final String riskLevel; // 'Safe', 'Medium', 'High'
-
-  /// Weather alerts detected on this route.
-  final List<WeatherAlert> weatherAlerts;
-
-  /// Creates a [RouteModel].
-  const RouteModel({
-    required this.points,
-    required this.distanceMeters,
-    required this.durationSeconds,
-    required this.steps,
-    required this.isRaining,
-    required this.riskLevel,
-    required this.weatherAlerts,
+  /// Creates an [ElevationDip].
+  ElevationDip({
+    required this.point,
+    this.depthMeters = 0.0,
+    required this.isHighRisk,
+    this.distanceFromStart = 0.0,
   });
-
-  /// Safely parse a route from OSRM response.
-  factory RouteModel.fromOsrmJson(Map<String, dynamic> json) {
-    final geometry = ((json['geometry']
-            as Map<String, dynamic>?)?['coordinates'] as List?) ??
-        [];
-    final List<LatLng> points = geometry
-        .map((dynamic c) {
-          try {
-            final coord = c as List<dynamic>?;
-            return LatLng((coord?[1] as num?)?.toDouble() ?? 0.0,
-                (coord?[0] as num?)?.toDouble() ?? 0.0);
-          } catch (_) {
-            return const LatLng(0, 0);
-          }
-        })
-        .cast<LatLng>()
-        .toList();
-
-    final distance = (json['distance'] as num?)?.toDouble() ?? 0.0;
-    final duration = (json['duration'] as num?)?.toDouble() ?? 0.0;
-
-    final stepsJson = (((json['legs'] as List<dynamic>?)?[0]
-            as Map<String, dynamic>?)?['steps'] as List?) ??
-        [];
-    final steps = stepsJson
-        .map((dynamic step) =>
-            NavigationStep.fromJson(step as Map<String, dynamic>))
-        .toList();
-
-    return RouteModel(
-      points: points,
-      distanceMeters: distance,
-      durationSeconds: duration,
-      steps: steps,
-      isRaining: false,
-      riskLevel: 'Unknown',
-      weatherAlerts: [],
-    );
-  }
-
-  /// Create a copy with weather analysis results.
-  RouteModel copyWithWeather({
-    required bool isRaining,
-    required String riskLevel,
-    required List<WeatherAlert> weatherAlerts,
-  }) {
-    return RouteModel(
-      points: points,
-      distanceMeters: distanceMeters,
-      durationSeconds: durationSeconds,
-      steps: steps,
-      isRaining: isRaining,
-      riskLevel: riskLevel,
-      weatherAlerts: weatherAlerts,
-    );
-  }
-
-  /// Get distance in kilometers (formatted).
-  String get distanceKm => '${(distanceMeters / 1000).toStringAsFixed(1)} km';
-
-  /// Get duration in minutes (formatted).
-  int get durationMinutes => (durationSeconds / 60).round();
-
-  /// Get risk color based on level.
-  String get riskColor {
-    if (riskLevel == 'High') return 'Red';
-    if (riskLevel == 'Medium') return 'Orange';
-    return 'Green';
-  }
-}
-
-/// Represents geocoding result for address search.
-class GeocodingResult {
-  /// The geographic coordinates of this location.
-  final LatLng coordinates;
-
-  /// The full display name of this location.
-  final String displayName;
-
-  /// Creates a [GeocodingResult].
-  const GeocodingResult({
-    required this.coordinates,
-    required this.displayName,
-  });
-
-  /// Parse geocoding result from Nominatim API JSON response.
-  factory GeocodingResult.fromNominatimJson(Map<String, dynamic> json) {
-    final lat = double.tryParse(json['lat']?.toString() ?? '0') ?? 0.0;
-    final lon = double.tryParse(json['lon']?.toString() ?? '0') ?? 0.0;
-    final displayName = json['display_name']?.toString() ?? 'Unknown Location';
-
-    return GeocodingResult(
-      coordinates: LatLng(lat, lon),
-      displayName: displayName,
-    );
-  }
-}
-
-/// Represents a hazard report from a user.
-class HazardReport {
-  /// The geographic location of this hazard.
-  final LatLng location;
-
-  /// The type of hazard ('Waterlogging', 'Accident', or 'RoadBlock').
-  final String hazardType; // 'Waterlogging', 'Accident', 'RoadBlock'
-
-  /// The time when this hazard was reported.
-  final DateTime timestamp;
-
-  /// Creates a [HazardReport].
-  const HazardReport({
-    required this.location,
-    required this.hazardType,
-    required this.timestamp,
-  });
-
-  /// Convert to JSON for API submission.
-  Map<String, dynamic> toJson() {
-    return {
-      'latitude': location.latitude,
-      'longitude': location.longitude,
-      'hazardType': hazardType,
-      'timestamp': timestamp.toIso8601String(),
-    };
-  }
 }

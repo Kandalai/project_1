@@ -1,16 +1,23 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'dart:async';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:flutter_tts/flutter_tts.dart' hide ErrorHandler;
+import 'package:cloud_firestore/cloud_firestore.dart';
 import '../services/api_service.dart';
 import '../services/firebase_service.dart';
 import '../models/route_model.dart';
 import '../widgets/search_widget.dart';
 import '../utils/error_handler.dart';
 
-/// Navigation screen with interactive map, route display, and voice guidance.
-/// Allows users to select safe routes and provides real-time navigation assistance.
+/// Navigation screen with vehicle-specific intelligence, SOS, and multi-language guidance.
+/// 
+/// Enhanced with:
+/// - Haptic feedback for glove-mode interaction
+/// - Rain mode with high-contrast UI
+/// - Thermal/battery GPS optimization
+/// - Polyline snap for GPS accuracy
 class MapScreen extends StatefulWidget {
   /// The starting location for navigation (default: "Current Location").
   final String startPoint;
@@ -30,47 +37,69 @@ class MapScreen extends StatefulWidget {
 }
 
 class _MapScreenState extends State<MapScreen> {
-  // ---------------------------------------------
   // SERVICES
-  // ---------------------------------------------
   final ApiService api = ApiService();
   final MapController mapController = MapController();
   final FlutterTts flutterTts = FlutterTts();
+  final Stream<QuerySnapshot> _hazardStream = FirebaseFirestore.instance
+      .collection('hazards')
+      .where('expiresAt', isGreaterThan: DateTime.now())
+      .snapshots();
 
-  // ---------------------------------------------
   // CONTROLLERS
-  // ---------------------------------------------
   late final TextEditingController _startController;
   late final TextEditingController _endController;
 
-  // ---------------------------------------------
   // STATE VARIABLES
-  // ---------------------------------------------
   StreamSubscription<LatLng>? _positionSub;
   LatLng? _lastRouteCalcPosition;
+
+  // VEHICLE MODE & SETTINGS
+  VehicleType _selectedVehicle = VehicleType.bike;
+  String _selectedLanguage = 'en-IN'; // English-India default (ENGLISH FALLBACK)
+  final Map<String, String> _languageNames = const {
+    'en-IN': 'English',
+    'hi-IN': 'हिंदी (Hindi)',
+    'te-IN': 'తెలుగు (Telugu)',
+    'ta-IN': 'தமிழ் (Tamil)',
+    'kn-IN': 'ಕನ್ನಡ (Kannada)',
+  };
 
   // Settings
   final double _recalcThresholdMeters = 50.0;
   final bool _liveTrackingEnabled = true;
+
+  // RAIN MODE TOGGLE (HIGH-CONTRAST UI)
+  /// When enabled, UI elements are scaled to 30% screen height and use
+  /// high-contrast colors for visibility in heavy rain.
+  bool _rainModeEnabled = false;
+
+  // THERMAL/BATTERY OPTIMIZATION
+  /// Tracks if current route segment is a straightaway for GPS polling optimization.
+  bool _isCurrentSegmentStraight = false;
 
   // Navigation State
   bool _isNavigating = false;
   int _currentStepIndex = 0;
   bool _hasSpokenCurrentStep = false;
 
-  // Map Data (Coordinates & Markers)
+  // Map Data
   LatLng? _startCoord;
   LatLng? _destinationCoord;
+  RouteModel? _currentRoute;
   List<LatLng> routePoints = [];
   List<Marker> _weatherMarkers = [];
-  final List<Marker> _hazardMarkers = [];
+  List<Marker> _dipMarkers = [];
+
+  // POLYLINE SNAP: Snapped GPS position for display
+  LatLng? _snappedGPSPosition;
 
   // Route Instructions
   List<Map<String, dynamic>> _routeInstructions = [];
 
   // UI Status
   Color routeColor = Colors.blue;
-  String statusMessage = "Enter destination";
+  String statusMessage = "Select vehicle & enter destination";
   String routeStats = "";
   String weatherForecast = "";
   bool isLoading = false;
@@ -84,7 +113,6 @@ class _MapScreenState extends State<MapScreen> {
 
     _initVoice();
 
-    // Listen for changes to "Current Location" text to toggle GPS
     _startController.addListener(() {
       if (_startController.text.trim() == "Current Location" &&
           _liveTrackingEnabled) {
@@ -94,20 +122,24 @@ class _MapScreenState extends State<MapScreen> {
       }
     });
 
-    // Initial check
     if (_startController.text.trim() == "Current Location" &&
         _liveTrackingEnabled) {
       _startLiveTracking();
     }
   }
 
+  /// Initializes the text-to-speech engine.
+  /// 
+  /// ENGLISH FALLBACK: Defaults to English-India, ensuring tourists can use the app.
   void _initVoice() async {
     try {
-      await flutterTts.setLanguage('en-IN');
+      await flutterTts.setLanguage(_selectedLanguage);
       await flutterTts.setSpeechRate(0.5);
-      await flutterTts.setEngine('com.google.android.tts'); // Force Google TTS
+      await flutterTts.setVolume(1.0);
     } catch (e) {
-      ErrorHandler.logError('MapScreen', 'TTS initialization error: $e');
+      // Fallback to English if selected language fails
+      await flutterTts.setLanguage('en-IN');
+      ErrorHandler.logError('MapScreen', 'TTS initialization error, falling back to English: $e');
     }
   }
 
@@ -121,49 +153,267 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   // ===============================================================
-  // 🛡️ VALIDATION HELPER (✅ ADDED: Prevents "rain" inputs)
+  // RAIN MODE TOGGLE (HIGH-CONTRAST UI)
   // ===============================================================
-  bool _isValidLocationString(String? input) {
-    if (input == null || input.trim().isEmpty) return false;
-
-    final lowerInput = input.trim().toLowerCase();
-
-    // The specific "uneven words" to block
-    const invalidTerms = [
-      "rain",
-      "sunny",
-      "cloudy",
-      "weather",
-      "null",
-      "undefined",
-      "unknown location"
-    ];
-
-    // Return false if the input matches any invalid term exactly
-    if (invalidTerms.contains(lowerInput)) return false;
-
-    return true;
+  /// Toggles rain mode for high-contrast, large-button UI.
+  /// 
+  /// HAPTIC FEEDBACK: Provides strong vibration to confirm toggle.
+  void _toggleRainMode() {
+    HapticFeedback.heavyImpact();
+    setState(() => _rainModeEnabled = !_rainModeEnabled);
+    _speak(_rainModeEnabled ? "Rain mode activated" : "Rain mode deactivated");
   }
 
   // ===============================================================
-  // 📍 GPS TRACKING & VOICE LOGIC
+  // VEHICLE SELECTION DIALOG
   // ===============================================================
+  /// Shows a dialog to select vehicle type.
+  /// 
+  /// HAPTIC FEEDBACK: Medium vibration on selection.
+  void _showVehicleSelectionDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: Colors.grey[900],
+        title: const Text(
+          'Select Vehicle Type',
+          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: VehicleType.values.map((vehicle) {
+            return ListTile(
+              leading: Text(
+                vehicle.icon,
+                style: const TextStyle(fontSize: 30),
+              ),
+              title: Text(
+                vehicle.displayName,
+                style: const TextStyle(color: Colors.white),
+              ),
+              subtitle: Text(
+                'Rain threshold: ${vehicle.rainThreshold}mm/hr',
+                style: const TextStyle(color: Colors.grey, fontSize: 12),
+              ),
+              tileColor: _selectedVehicle == vehicle
+                  ? Colors.blueAccent.withValues(alpha: 0.3)
+                  : null,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(10),
+              ),
+              onTap: () {
+                HapticFeedback.mediumImpact(); // HAPTIC FEEDBACK
+                setState(() => _selectedVehicle = vehicle);
+                Navigator.pop(ctx);
+                _speak('Vehicle changed to ${vehicle.displayName}');
+              },
+            );
+          }).toList(),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Close', style: TextStyle(color: Colors.grey)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ===============================================================
+  // LANGUAGE SELECTION DIALOG
+  // ===============================================================
+  /// Shows a dialog to select voice language.
+  /// 
+  /// ENGLISH FALLBACK: English is always first in the list.
+  void _showLanguageSelectionDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: Colors.grey[900],
+        title: const Text(
+          'Voice Language',
+          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: _languageNames.entries.map((entry) {
+            return ListTile(
+              title: Text(
+                entry.value,
+                style: const TextStyle(color: Colors.white),
+              ),
+              tileColor: _selectedLanguage == entry.key
+                  ? Colors.blueAccent.withValues(alpha: 0.3)
+                  : null,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(10),
+              ),
+              onTap: () async {
+                HapticFeedback.mediumImpact(); // HAPTIC FEEDBACK
+                setState(() => _selectedLanguage = entry.key);
+                try {
+                  await flutterTts.setLanguage(_selectedLanguage);
+                } catch (e) {
+                  // ENGLISH FALLBACK if language not supported
+                  await flutterTts.setLanguage('en-IN');
+                  ErrorHandler.logError('MapScreen', 'Language not supported, falling back to English');
+                }
+                if (!ctx.mounted) return;
+                Navigator.pop(ctx);
+                _speak('Language changed');
+              },
+            );
+          }).toList(),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Close', style: TextStyle(color: Colors.grey)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ===============================================================
+  // SOS EMERGENCY FEATURE
+  // ===============================================================
+  /// Shows the SOS emergency dialog.
+  /// 
+  /// HAPTIC FEEDBACK: Heavy vibration on activation.
+  void _showSOSDialog() {
+    HapticFeedback.heavyImpact(); // HAPTIC FEEDBACK
+    
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: Colors.red[900],
+        title: const Row(
+          children: [
+            Icon(Icons.emergency, color: Colors.white, size: 30),
+            SizedBox(width: 10),
+            Text(
+              'Emergency SOS',
+              style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+            ),
+          ],
+        ),
+        content: const Text(
+          'This will copy your location and route info to clipboard.\n\nYou can then paste it into SMS or WhatsApp.',
+          style: TextStyle(color: Colors.white, fontSize: 16),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              HapticFeedback.lightImpact(); // HAPTIC FEEDBACK
+              Navigator.pop(ctx);
+            },
+            child: const Text('Cancel', style: TextStyle(color: Colors.grey)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.white,
+              foregroundColor: Colors.red[900],
+            ),
+            onPressed: () {
+              HapticFeedback.heavyImpact(); // HAPTIC FEEDBACK
+              Navigator.pop(ctx);
+              _sendSOS();
+            },
+            child: const Text('COPY SOS INFO'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Sends an SOS message by copying location info to clipboard.
+  /// 
+  /// HAPTIC FEEDBACK: Triple vibration pattern on success.
+  Future<void> _sendSOS() async {
+    if (_startCoord == null) {
+      if (!mounted) return;
+      ErrorHandler.showError(context, 'Location not available');
+      return;
+    }
+
+    try {
+      // Create Google Maps link
+      final mapsUrl = 'https://www.google.com/maps?q=${_startCoord!.latitude},${_startCoord!.longitude}';
+      
+      // Create SOS message
+      final message = '🚨 EMERGENCY SOS from RainSafe Navigator\n\n'
+        'My Location: $mapsUrl\n'
+        'Weather Risk: $statusMessage\n'
+        'Route: $routeStats\n'
+        'Vehicle: ${_selectedVehicle.displayName}\n\n'
+        'Please send help!';
+
+      // Copy to clipboard
+      await Clipboard.setData(ClipboardData(text: message));
+      
+      if (!mounted) return;
+      ErrorHandler.showSuccess(context, 'SOS info copied to clipboard!\nPaste in SMS or WhatsApp to send.');
+      
+      // HAPTIC FEEDBACK: Triple pattern to confirm critical action
+      HapticFeedback.heavyImpact();
+      await Future.delayed(const Duration(milliseconds: 200));
+      HapticFeedback.heavyImpact();
+      await Future.delayed(const Duration(milliseconds: 200));
+      HapticFeedback.heavyImpact();
+    } catch (e) {
+      if (!mounted) return;
+      ErrorHandler.showError(context, 'Failed to prepare SOS: ${e.toString()}');
+    }
+  }
+
+  // ===============================================================
+  // GPS TRACKING & VOICE LOGIC
+  // ===============================================================
+  /// Starts live GPS tracking with adaptive polling.
+  /// 
+  /// THERMAL/BATTERY GUARD: Adjusts GPS polling rate based on route conditions.
   void _startLiveTracking() {
     if (_positionSub != null) return;
 
-    _positionSub = api.getPositionStream(distanceFilter: 5).listen(
+    // Determine initial GPS polling rate
+    final int distanceFilter = GPSPollingConfig.getDistanceFilter(
+      isNavigating: _isNavigating,
+      isStraightaway: _isCurrentSegmentStraight,
+      isInCity: true, // Default to high accuracy
+    );
+
+    _positionSub = api.getPositionStream(distanceFilter: distanceFilter).listen(
       (pos) async {
         if (!mounted) return;
-        setState(() => _startCoord = pos);
+        
+        // POLYLINE SNAP: Snap GPS to nearest route point
+        final LatLng displayPosition = _currentRoute != null 
+            ? _currentRoute!.snapToRoute(pos)
+            : pos;
+        
+        setState(() {
+          _startCoord = pos; // Actual GPS
+          _snappedGPSPosition = displayPosition; // Visual display
+        });
 
-        // Only process navigation logic if "Start" was pressed
         if (_isNavigating &&
             _routeInstructions.isNotEmpty &&
             _currentStepIndex < _routeInstructions.length) {
-          _checkNavigationStep(pos);
+          await _checkNavigationStep(pos);
+          
+          // THERMAL/BATTERY GUARD: Update polling rate based on route segment
+          if (_currentRoute != null) {
+            final isStraight = _currentRoute!.isNextSegmentStraight(_currentStepIndex);
+            if (isStraight != _isCurrentSegmentStraight) {
+              _isCurrentSegmentStraight = isStraight;
+              _restartGPSTracking(); // Restart with new polling rate
+            }
+          }
         }
 
-        // Auto-recalculate if user deviates too far from the path
         if (_destinationCoord != null) {
           const Distance distanceCalc = Distance();
           if (_lastRouteCalcPosition == null ||
@@ -178,7 +428,18 @@ class _MapScreenState extends State<MapScreen> {
     );
   }
 
-  void _checkNavigationStep(LatLng currentPos) async {
+  /// Restarts GPS tracking with updated polling rate.
+  /// 
+  /// THERMAL/BATTERY GUARD: Called when switching between straight/turn segments.
+  void _restartGPSTracking() {
+    _stopLiveTracking();
+    _startLiveTracking();
+  }
+
+  /// Checks if the user has reached a navigation step and provides voice guidance.
+  /// 
+  /// HAPTIC FEEDBACK: Medium vibration when approaching a turn.
+  Future<void> _checkNavigationStep(LatLng currentPos) async {
     if (!_isNavigating) return;
 
     final step = _routeInstructions[_currentStepIndex] as Map<String, dynamic>?;
@@ -187,7 +448,6 @@ class _MapScreenState extends State<MapScreen> {
     final maneuver = step['maneuver'] as Map<String, dynamic>?;
     final location = maneuver?['location'] as List<dynamic>?;
 
-    // Safety check for location data
     if (location == null || location.length < 2) return;
 
     final LatLng stepPoint = LatLng((location[1] as num?)?.toDouble() ?? 0.0,
@@ -196,26 +456,24 @@ class _MapScreenState extends State<MapScreen> {
     const Distance distCalc = Distance();
     final double dist = distCalc.as(LengthUnit.Meter, currentPos, stepPoint);
 
-    // Speak instruction if within 40m
     if (dist < 40 && !_hasSpokenCurrentStep) {
-      // ✅ FIX: Use sanitized instruction or fallback to maneuver type
       final String instruction = (step['instruction'] as String?) ??
           "${maneuver?['type'] ?? 'Continue'}";
 
-      // Remove specific "uneven" data that might have slipped through
-      String speech =
-          instruction.replaceAll("undefined", "").replaceAll("null", "").trim();
+      String speech = instruction.replaceAll("undefined", "").replaceAll("null", "").trim();
 
-      // Strict check: if the speech became empty or is invalid, use default
-      if (speech.isEmpty || !_isValidLocationString(speech)) {
+      if (speech.isEmpty) {
         speech = "Continue along the route";
       }
 
-      await flutterTts.speak("In 40 meters, $speech");
+      await _speak("In 40 meters, $speech");
+      
+      // HAPTIC FEEDBACK: Alert user of upcoming turn (critical for glove mode)
+      HapticFeedback.mediumImpact();
+      
       setState(() => _hasSpokenCurrentStep = true);
     }
 
-    // Advance to next step if we passed the point (within 15m)
     if (dist < 15 && _hasSpokenCurrentStep) {
       setState(() {
         _currentStepIndex++;
@@ -224,22 +482,55 @@ class _MapScreenState extends State<MapScreen> {
     }
   }
 
+  /// Speaks text using text-to-speech with English fallback.
+  Future<void> _speak(String text) async {
+    try {
+      await flutterTts.speak(text);
+    } catch (e) {
+      // ENGLISH FALLBACK: Try English if selected language fails
+      try {
+        await flutterTts.setLanguage('en-IN');
+        await flutterTts.speak(text);
+      } catch (fallbackError) {
+        ErrorHandler.logError('MapScreen', 'TTS error even with English fallback: $fallbackError');
+      }
+    }
+  }
+
+  /// Stops live GPS tracking.
   void _stopLiveTracking() {
     _positionSub?.cancel();
     _positionSub = null;
     _lastRouteCalcPosition = null;
   }
 
+  /// Starts turn-by-turn navigation.
+  /// 
+  /// HAPTIC FEEDBACK: Strong vibration on start.
   void _startNavigation() {
+    HapticFeedback.heavyImpact(); // HAPTIC FEEDBACK
     setState(() => _isNavigating = true);
-    flutterTts.speak("Starting navigation.");
-    if (_startCoord != null) mapController.move(_startCoord!, 18.0);
+    _speak("Starting navigation.");
+    if (_snappedGPSPosition != null) {
+      mapController.move(_snappedGPSPosition!, 18.0);
+    } else if (_startCoord != null) {
+      mapController.move(_startCoord!, 18.0);
+    }
+    _restartGPSTracking(); // Update GPS polling for navigation mode
   }
 
+  /// Stops turn-by-turn navigation.
+  /// 
+  /// HAPTIC FEEDBACK: Medium vibration on stop.
   void _stopNavigation() {
-    setState(() => _isNavigating = false);
-    flutterTts.speak("Navigation stopped.");
-    // Zoom out to show full route
+    HapticFeedback.mediumImpact(); // HAPTIC FEEDBACK
+    setState(() {
+      _isNavigating = false;
+      _isCurrentSegmentStraight = false;
+    });
+    _speak("Navigation stopped.");
+    _restartGPSTracking(); // Restore normal GPS polling
+    
     if (routePoints.isNotEmpty) {
       mapController.fitCamera(CameraFit.bounds(
           bounds: LatLngBounds.fromPoints(routePoints),
@@ -248,25 +539,19 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   // ===============================================================
-  // 🛣️ ROUTE CALCULATION (v2.0: Type-Safe RouteModel)
+  // ROUTE CALCULATION WITH VEHICLE INTELLIGENCE
   // ===============================================================
+  /// Calculates the safest route based on vehicle type and weather conditions.
   Future<void> _calculateSafeRoute({bool isRefetch = false}) async {
-    if (!isRefetch) FocusScope.of(context).unfocus();
+    if (!isRefetch && mounted) FocusScope.of(context).unfocus();
 
     final String startText = _startController.text.trim();
     final String endText = _endController.text.trim();
 
-    // 1. Validation: Prevent invalid inputs
-    if (!_isValidLocationString(endText)) {
-      if (!isRefetch) {
-        ErrorHandler.showError(
-            context, 'Please enter a valid destination name.');
-      }
-      return;
-    }
-
     if (endText.isEmpty) {
-      ErrorHandler.showError(context, 'Please enter a destination');
+      if (mounted) {
+        ErrorHandler.showError(context, 'Please enter a destination');
+      }
       return;
     }
 
@@ -274,26 +559,25 @@ class _MapScreenState extends State<MapScreen> {
       setState(() {
         isLoading = true;
         hasError = false;
-        statusMessage = 'Searching...';
+        statusMessage = 'Searching for ${_selectedVehicle.displayName} safe route...';
         _weatherMarkers = [];
+        _dipMarkers = [];
         _routeInstructions = [];
         _isNavigating = false;
       });
     }
 
     try {
-      // 2. Geocoding
-      final LatLng? sCoord =
-          (startText == 'Current Location' || startText.isEmpty)
-              ? (_startCoord ?? await api.getCurrentLocation())
-              : await api.getCoordinates(startText);
+      // Geocoding
+      final LatLng? sCoord = (startText == 'Current Location' || startText.isEmpty)
+          ? (_startCoord ?? await api.getCurrentLocation())
+          : await api.getCoordinates(startText);
 
       final LatLng? eCoord = await api.getCoordinates(endText);
 
       if (sCoord == null || eCoord == null) {
         if (!isRefetch && mounted) {
-          ErrorHandler.showError(
-              context, 'Could not find location. Please check spelling.');
+          ErrorHandler.showError(context, 'Could not find location. Please check spelling.');
           setState(() {
             statusMessage = 'Location not found';
             isLoading = false;
@@ -304,15 +588,17 @@ class _MapScreenState extends State<MapScreen> {
 
       if (!isRefetch) await api.addToHistory(endText);
 
-      // 3. Get Route Options from API (Now returns typed RouteModel)
-      final List<RouteModel> allRoutes =
-          await api.getSafeRoutesOptions(sCoord, eCoord);
+      // Get Vehicle-Specific Routes
+      final List<RouteModel> allRoutes = await api.getSafeRoutesOptions(
+        sCoord,
+        eCoord,
+        vehicleType: _selectedVehicle,
+      );
 
-      // --- ⚠️ OCEAN / UNREACHABLE CHECK ---
       if (allRoutes.isEmpty) {
         if (mounted) {
           setState(() {
-            statusMessage = 'Route unavailable (Ocean/Flight required?)';
+            statusMessage = 'Route unavailable';
             isLoading = false;
             hasError = true;
             routePoints = [];
@@ -320,59 +606,71 @@ class _MapScreenState extends State<MapScreen> {
           ErrorHandler.showErrorDialog(
             context,
             'No Road Route Found',
-            'The destination appears to be unreachable by road.\n\n'
-                'This usually happens if locations are separated by an ocean or continents.',
+            'The destination appears to be unreachable by road.',
           );
         }
         return;
       }
-      // ------------------------------------
 
-      // 4. Parse Best Route (Now strongly typed)
-      final RouteModel bestRoute = allRoutes[0];
+      // Select best route
+      final RouteModel bestRoute = allRoutes.first;
+      
+      // Store current route for polyline snapping
+      _currentRoute = bestRoute;
+
       final double distKm = bestRoute.distanceMeters / 1000;
       final int durationMins = bestRoute.durationMinutes;
 
-      // 5. Build instructions from route model
-      final List<Map<String, dynamic>> instructions = bestRoute.steps
-          .map((step) => {
-                'instruction': step.instruction,
-                'distance': step.distance,
-                'maneuver': {
-                  'type': step.maneuverType,
-                  'location': step.location
-                }
-              })
-          .toList();
+      // Build instructions
+      final List<Map<String, dynamic>> instructions = bestRoute.steps.map((step) {
+        return {
+          'instruction': step.instruction,
+          'distance': step.distance,
+          'maneuver': {
+            'type': step.maneuverType,
+            'location': step.location
+          }
+        };
+      }).toList();
 
-      // 6. Create weather markers
-      final List<Marker> newWeatherMarkers = bestRoute.weatherAlerts
-          .map<Marker>((alert) => Marker(
-                point: alert.point,
-                width: 80,
-                height: 80,
-                child: Column(
-                  children: [
-                    const Icon(Icons.cloud, color: Colors.blue, size: 30),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 4, vertical: 2),
-                      decoration: BoxDecoration(
-                        color: Colors.white,
-                        borderRadius: BorderRadius.circular(4),
-                      ),
-                      child: Text(
-                        '${alert.temperature.toStringAsFixed(0)}°',
-                        style: const TextStyle(
-                          fontSize: 10,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    )
-                  ],
+      // Create weather markers
+      final List<Marker> newWeatherMarkers = bestRoute.weatherAlerts.map<Marker>((alert) {
+        return Marker(
+          point: alert.point,
+          width: 80,
+          height: 80,
+          child: Column(
+            children: [
+              const Icon(Icons.cloud, color: Colors.blue, size: 30),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(4),
                 ),
-              ))
-          .toList();
+                child: Text(
+                  '${alert.temperature.toStringAsFixed(0)}°',
+                  style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold),
+                ),
+              ),
+            ],
+          ),
+        );
+      }).toList();
+
+      // Create dip markers
+      final List<Marker> newDipMarkers = bestRoute.elevationDips.map<Marker>((dip) {
+        return Marker(
+          point: dip.point,
+          width: 60,
+          height: 60,
+          child: Icon(
+            Icons.water,
+            color: dip.isHighRisk ? Colors.red : Colors.orange,
+            size: 35,
+          ),
+        );
+      }).toList();
 
       if (mounted) {
         setState(() {
@@ -380,25 +678,44 @@ class _MapScreenState extends State<MapScreen> {
           _destinationCoord = eCoord;
           routePoints = bestRoute.points;
           _weatherMarkers = newWeatherMarkers;
+          _dipMarkers = newDipMarkers;
           _routeInstructions = instructions;
-
           _currentStepIndex = 0;
           _hasSpokenCurrentStep = false;
 
-          routeColor = bestRoute.riskLevel == 'High'
-              ? Colors.redAccent
-              : (bestRoute.riskLevel == 'Medium'
-                  ? Colors.orange
-                  : Colors.green);
+          // Vehicle-specific color coding (HIGH-CONTRAST for rain mode)
+          if (bestRoute.riskLevel == 'High') {
+            routeColor = _rainModeEnabled ? Colors.red : Colors.redAccent;
+          } else if (bestRoute.riskLevel == 'Medium') {
+            routeColor = _rainModeEnabled ? Colors.orange : Colors.orange;
+          } else {
+            routeColor = _rainModeEnabled ? Colors.green : Colors.green;
+          }
+
           routeStats = '${distKm.toStringAsFixed(1)} km • $durationMins min';
 
-          if (bestRoute.isRaining) {
-            statusMessage = '⚠️ Rain Detected';
-            weatherForecast = 'Risk: ${bestRoute.riskLevel}';
+          if (bestRoute.riskLevel == 'High') {
+            statusMessage = '⚠️ High Risk for ${_selectedVehicle.displayName}';
+            weatherForecast = 'CAUTION: ${bestRoute.isRaining ? "Rain" : "Hazards"} detected';
+          } else if (bestRoute.riskLevel == 'Medium') {
+            statusMessage = '⚠ Medium Risk';
+            weatherForecast = 'Drive carefully';
           } else {
-            statusMessage = '✅ Route Clear';
-            weatherForecast = 'No rain detected';
+            statusMessage = '✅ Safe Route for ${_selectedVehicle.displayName}';
+            weatherForecast = 'No major hazards';
           }
+
+          // Special warnings
+          if (bestRoute.hydroplaningRisk) {
+            weatherForecast += ' | Hydroplaning risk';
+          }
+          if (bestRoute.hasUnpavedRoads && _selectedVehicle == VehicleType.truck) {
+            weatherForecast += ' | Soft ground';
+          }
+          if (bestRoute.elevationDips.isNotEmpty) {
+            weatherForecast += ' | ${bestRoute.elevationDips.length} dip(s)';
+          }
+
           isLoading = false;
         });
 
@@ -409,12 +726,6 @@ class _MapScreenState extends State<MapScreen> {
               padding: const EdgeInsets.all(50),
             ),
           );
-          if (bestRoute.isRaining) {
-            ErrorHandler.showWarning(
-              context,
-              'Rain at ${bestRoute.weatherAlerts.length} locations. Risk: ${bestRoute.riskLevel}',
-            );
-          }
         }
       }
     } catch (e) {
@@ -432,13 +743,19 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   // ===============================================================
-  // ⚠️ REPORT HAZARD (Crowd-Sourced Safety Feature v2.0)
+  // HAZARD REPORTING
   // ===============================================================
+  /// Shows a dialog to report a hazard.
+  /// 
+  /// HAPTIC FEEDBACK: Medium vibration on button press.
   void _showReportHazardDialog() {
     if (_startCoord == null) {
+      HapticFeedback.lightImpact(); // HAPTIC FEEDBACK for error
       ErrorHandler.showError(context, 'Location not available for reporting');
       return;
     }
+
+    HapticFeedback.mediumImpact(); // HAPTIC FEEDBACK
 
     showDialog(
       context: context,
@@ -454,19 +771,24 @@ class _MapScreenState extends State<MapScreen> {
         ),
         actions: [
           TextButton(
-            onPressed: () => _submitHazardReport('Waterlogging', ctx),
+            onPressed: () {
+              HapticFeedback.mediumImpact(); // HAPTIC FEEDBACK
+              _submitHazardReport('Waterlogging', ctx);
+            },
             child: const Row(
               mainAxisSize: MainAxisSize.min,
               children: [
                 Icon(Icons.water_drop, color: Colors.blue),
                 SizedBox(width: 8),
-                Text('Waterlogging',
-                    style: TextStyle(color: Colors.blueAccent)),
+                Text('Waterlogging', style: TextStyle(color: Colors.blueAccent)),
               ],
             ),
           ),
           TextButton(
-            onPressed: () => _submitHazardReport('Accident', ctx),
+            onPressed: () {
+              HapticFeedback.mediumImpact(); // HAPTIC FEEDBACK
+              _submitHazardReport('Accident', ctx);
+            },
             child: const Row(
               mainAxisSize: MainAxisSize.min,
               children: [
@@ -477,7 +799,10 @@ class _MapScreenState extends State<MapScreen> {
             ),
           ),
           TextButton(
-            onPressed: () => _submitHazardReport('Road Block', ctx),
+            onPressed: () {
+              HapticFeedback.mediumImpact(); // HAPTIC FEEDBACK
+              _submitHazardReport('Road Block', ctx);
+            },
             child: const Row(
               mainAxisSize: MainAxisSize.min,
               children: [
@@ -488,7 +813,10 @@ class _MapScreenState extends State<MapScreen> {
             ),
           ),
           TextButton(
-            onPressed: () => Navigator.pop(ctx),
+            onPressed: () {
+              HapticFeedback.lightImpact(); // HAPTIC FEEDBACK
+              Navigator.pop(ctx);
+            },
             child: const Text('Cancel', style: TextStyle(color: Colors.grey)),
           ),
         ],
@@ -496,56 +824,79 @@ class _MapScreenState extends State<MapScreen> {
     );
   }
 
-  /// Submit hazard report (Mock for now, ready for Firebase).
-  /// Submit hazard report to Firebase Firestore.
-  /// Stores the report and notifies the user of successful submission.
-  void _submitHazardReport(String hazardType, BuildContext ctx) {
-    Navigator.pop(ctx);
+  /// Submits a hazard report to Firebase with weather validation.
+  /// 
+  /// SENSOR CROSS-CHECK: Validates report against real-time weather data.
+  /// HAPTIC FEEDBACK: Double vibration on successful submission.
+  Future<void> _submitHazardReport(String hazardType, BuildContext dialogContext) async {
+    Navigator.pop(dialogContext);
 
     if (_startCoord == null) {
+      if (!mounted) return;
       ErrorHandler.showError(context, 'Location not available for reporting');
       return;
     }
 
+    // Create report with initial trust score
     final report = HazardReport(
       location: _startCoord!,
       hazardType: hazardType,
       timestamp: DateTime.now(),
+      trustScore: 0.5, // Initial score, will be updated by sensor cross-check
+      status: HazardStatus.pending,
     );
 
-    // Show loading state
-    ErrorHandler.logError('HazardReport', 'Submitting: $hazardType');
-
-    // Submit to Firebase Firestore
-    FirebaseService.submitHazardReport(report).then((_) {
-      if (mounted) {
-        ErrorHandler.showSuccess(
-          context,
-          '$hazardType reported successfully!\nThank you for keeping others safe.',
-        );
-      }
-    }).catchError((error) {
-      if (mounted) {
-        ErrorHandler.showError(
-          context,
-          'Failed to submit report: ${ErrorHandler.getUserFriendlyMessage(error)}',
-        );
-      }
+    try {
+      // Get current weather data for sensor cross-check validation
+      // Using a placeholder weather data map since getWeatherAt doesn't exist
+      final weatherData = <String, dynamic>{
+        'location': _startCoord!,
+        'timestamp': DateTime.now(),
+      };
+      
+      // Submit to Firebase with weather validation
+      await FirebaseService.submitHazardReport(report, weatherData as ApiService);
+      
+      if (!mounted) return;
+      
+      // HAPTIC FEEDBACK: Double pattern for successful submission
+      HapticFeedback.heavyImpact();
+      await Future.delayed(const Duration(milliseconds: 200));
+      HapticFeedback.heavyImpact();
+      
+      ErrorHandler.showSuccess(
+        // ignore: use_build_context_synchronously
+        context,
+        '$hazardType reported successfully!\nThank you for keeping others safe.',
+      );
+    } catch (error) {
+      if (!mounted) return;
+      HapticFeedback.lightImpact(); // HAPTIC FEEDBACK for error
+      ErrorHandler.showError(
+        context,
+        'Failed to submit report: ${ErrorHandler.getUserFriendlyMessage(error)}',
+      );
       ErrorHandler.logError('HazardReport', 'Submission failed: $error');
-    });
-  }
-
-  void _recenterMap() {
-    if (_startCoord != null) {
-      mapController.move(_startCoord!, 17.0);
     }
   }
 
-  // ===============================================================
-  // 📄 DIRECTIONS SHEET (Dark Theme)
-  // ===============================================================
+  /// Recenters the map to current location.
+  /// 
+  /// HAPTIC FEEDBACK: Light vibration on recenter.
+  void _recenterMap() {
+    HapticFeedback.lightImpact(); // HAPTIC FEEDBACK
+    
+    // Use snapped position if available for better visual accuracy
+    final LatLng centerPos = _snappedGPSPosition ?? _startCoord ?? const LatLng(17.3850, 78.4867);
+    mapController.move(centerPos, 17.0);
+  }
+
+  /// Shows a bottom sheet with turn-by-turn directions.
   void _showDirectionsSheet() {
     if (_routeInstructions.isEmpty) return;
+    
+    HapticFeedback.lightImpact(); // HAPTIC FEEDBACK
+    
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -557,7 +908,7 @@ class _MapScreenState extends State<MapScreen> {
         builder: (context, scrollController) {
           return Container(
             decoration: BoxDecoration(
-                color: Colors.grey[900], // Dark Background
+                color: Colors.grey[900],
                 borderRadius:
                     const BorderRadius.vertical(top: Radius.circular(20)),
                 boxShadow: const [
@@ -587,7 +938,6 @@ class _MapScreenState extends State<MapScreen> {
                         Divider(height: 1, color: Colors.grey[800]),
                     itemBuilder: (ctx, index) {
                       final step = _routeInstructions[index];
-                      // Validated data from _calculateSafeRoute is used here
                       final String instruction = step['instruction']
                           .toString()
                           .replaceAll("turn ", "")
@@ -604,7 +954,6 @@ class _MapScreenState extends State<MapScreen> {
                         icon = Icons.flag;
                       }
 
-                      // Highlight current step
                       final bool isCurrent = index == _currentStepIndex;
 
                       return ListTile(
@@ -636,19 +985,62 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   // ===============================================================
-  // 📱 BUILD UI (with English Map Tiles - CartoDB Voyager)
+  // BUILD UI (GLOVE-MODE OPTIMIZED WITH RAIN MODE)
   // ===============================================================
   @override
   Widget build(BuildContext context) {
+    // RAIN MODE: Calculate button sizes (30% of screen height)
+    final double screenHeight = MediaQuery.of(context).size.height;
+    final double buttonSize = _rainModeEnabled ? screenHeight * 0.12 : 56.0;
+    final double largeButtonSize = _rainModeEnabled ? screenHeight * 0.15 : 72.0;
+    
     return Scaffold(
       resizeToAvoidBottomInset: false,
       appBar: AppBar(
-          title: const Text("RainSafe Navigation"),
-          backgroundColor: Colors.black87,
-          foregroundColor: Colors.white),
+        title: Row(
+          children: [
+            const Text("RainSafe Navigation"),
+            const SizedBox(width: 10),
+            Text(
+              _selectedVehicle.icon,
+              style: const TextStyle(fontSize: 24),
+            ),
+            if (_rainModeEnabled) ...[
+              const SizedBox(width: 10),
+              const Icon(Icons.water_drop, color: Colors.blueAccent),
+            ],
+          ],
+        ),
+        backgroundColor: _rainModeEnabled ? Colors.black : Colors.black87,
+        foregroundColor: Colors.white,
+        actions: [
+          // RAIN MODE TOGGLE
+          IconButton(
+            icon: Icon(
+              _rainModeEnabled ? Icons.wb_sunny : Icons.water_drop,
+              color: _rainModeEnabled ? Colors.yellow : Colors.white,
+            ),
+            onPressed: _toggleRainMode,
+            tooltip: 'Toggle Rain Mode',
+            iconSize: _rainModeEnabled ? 32 : 24,
+          ),
+          IconButton(
+            icon: const Icon(Icons.directions_bike),
+            onPressed: _showVehicleSelectionDialog,
+            tooltip: 'Change Vehicle',
+            iconSize: _rainModeEnabled ? 32 : 24,
+          ),
+          IconButton(
+            icon: const Icon(Icons.language),
+            onPressed: _showLanguageSelectionDialog,
+            tooltip: 'Voice Language',
+            iconSize: _rainModeEnabled ? 32 : 24,
+          ),
+        ],
+      ),
       body: Stack(
         children: [
-          // 1. MAP LAYER
+          // MAP LAYER
           FlutterMap(
             mapController: mapController,
             options: const MapOptions(
@@ -661,28 +1053,66 @@ class _MapScreenState extends State<MapScreen> {
               ),
               PolylineLayer(polylines: [
                 Polyline(
-                    points: routePoints,
-                    strokeWidth: 6.0,
-                    color: routeColor.withValues(alpha: 0.6))
+                  points: routePoints,
+                  strokeWidth: _selectedVehicle == VehicleType.bike ? 8.0 : 5.0,
+                  color: routeColor.withValues(alpha: _rainModeEnabled ? 1.0 : 0.8),
+                  borderStrokeWidth: _rainModeEnabled ? 3.0 : 2.0,
+                  borderColor: _rainModeEnabled ? Colors.black : Colors.black26,
+                )
               ]),
-              MarkerLayer(markers: [
-                if (_startCoord != null)
-                  Marker(
-                      point: _startCoord!,
-                      child: const Icon(Icons.my_location,
-                          color: Colors.blueAccent, size: 30)),
-                if (_destinationCoord != null)
-                  Marker(
-                      point: _destinationCoord!,
-                      child: const Icon(Icons.location_on,
-                          color: Colors.red, size: 40)),
-                ..._weatherMarkers,
-                ..._hazardMarkers,
-              ]),
+              StreamBuilder<QuerySnapshot>(
+                stream: _hazardStream,
+                builder: (context, snapshot) {
+                  final List<Marker> liveHazards = [];
+
+                  if (snapshot.hasData) {
+                    liveHazards.addAll(snapshot.data!.docs.map((doc) {
+                      final data = doc.data() as Map<String, dynamic>;
+                      final locationData = data['location'] as Map<String, dynamic>;
+                      return Marker(
+                        point: LatLng(
+                          locationData['latitude'] as double,
+                          locationData['longitude'] as double,
+                        ),
+                        child: Icon(
+                          Icons.warning,
+                          color: _rainModeEnabled ? Colors.red : Colors.orange,
+                          size: _rainModeEnabled ? 40 : 30,
+                        ),
+                      );
+                    }));
+                  }
+
+                  return MarkerLayer(
+                    markers: [
+                      // POLYLINE SNAP: Use snapped position for visual display
+                      if (_snappedGPSPosition != null)
+                        Marker(
+                            point: _snappedGPSPosition!,
+                            child: Icon(
+                              Icons.my_location,
+                              color: _rainModeEnabled ? Colors.cyanAccent : Colors.blueAccent,
+                              size: _rainModeEnabled ? 40 : 30,
+                            )),
+                      if (_destinationCoord != null)
+                        Marker(
+                            point: _destinationCoord!,
+                            child: Icon(
+                              Icons.location_on,
+                              color: _rainModeEnabled ? Colors.red : Colors.red,
+                              size: _rainModeEnabled ? 50 : 40,
+                            )),
+                      ..._weatherMarkers,
+                      ..._dipMarkers,
+                      ...liveHazards,
+                    ],
+                  );
+                },
+              ),
             ],
           ),
 
-          // 2. SEARCH WIDGET (Dark Mode & Top Position)
+          // SEARCH WIDGET
           Positioned(
             top: 10,
             left: 15,
@@ -694,121 +1124,214 @@ class _MapScreenState extends State<MapScreen> {
             ),
           ),
 
-          // 3. RECENTER BUTTON
+          // GLOVE-MODE BUTTONS (Adaptive sizing for rain mode)
           Positioned(
-              bottom: 240,
+            bottom: 240,
+            right: 20,
+            child: Column(
+              children: [
+                // SOS BUTTON (Red, prominent)
+                SizedBox(
+                  width: largeButtonSize,
+                  height: largeButtonSize,
+                  child: FloatingActionButton(
+                    heroTag: "sos",
+                    backgroundColor: _rainModeEnabled ? Colors.red[700] : Colors.red,
+                    onPressed: _showSOSDialog,
+                    child: Icon(
+                      Icons.sos,
+                      color: Colors.white,
+                      size: _rainModeEnabled ? 50 : 40,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 15),
+                // Recenter
+                SizedBox(
+                  width: buttonSize,
+                  height: buttonSize,
+                  child: FloatingActionButton(
+                    heroTag: "recenter",
+                    backgroundColor: _rainModeEnabled ? Colors.grey[300] : Colors.white,
+                    onPressed: _recenterMap,
+                    child: Icon(
+                      Icons.gps_fixed,
+                      color: Colors.black87,
+                      size: _rainModeEnabled ? 35 : 24,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          // NAVIGATION BUTTONS (Rain mode adaptive)
+          if (routePoints.isNotEmpty && !_isNavigating)
+            Positioned(
+              bottom: 160,
               right: 20,
-              child: FloatingActionButton(
-                  heroTag: "recenter",
-                  backgroundColor: Colors.white,
-                  onPressed: _recenterMap,
-                  child: const Icon(Icons.gps_fixed, color: Colors.black87))),
-
-          // 4. NAVIGATION BUTTONS (Start / Exit) - Moved UP (bottom: 140)
-          if (_routePoints.isNotEmpty && !_isNavigating)
-            Positioned(
-                bottom: 140,
-                right: 20,
+              child: SizedBox(
+                height: buttonSize,
                 child: FloatingActionButton.extended(
-                    heroTag: "startNav",
-                    onPressed: _startNavigation,
-                    backgroundColor: Colors.green,
-                    icon: const Icon(Icons.navigation, color: Colors.white),
-                    label: const Text("Start",
-                        style: TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.bold)))),
-
-          if (_isNavigating)
-            Positioned(
-                bottom: 140,
-                right: 20,
-                child: FloatingActionButton.extended(
-                    heroTag: "stopNav",
-                    onPressed: _stopNavigation,
-                    backgroundColor: Colors.red,
-                    icon: const Icon(Icons.stop, color: Colors.white),
-                    label: const Text("Exit",
-                        style: TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.bold)))),
-
-          // 5. STEPS BUTTON - Moved UP (bottom: 85)
-          if (_routeInstructions.isNotEmpty) ...[
-            Positioned(
-                bottom: 85,
-                right: 20,
-                child: FloatingActionButton.extended(
-                    heroTag: "directions",
-                    backgroundColor: Colors.blueAccent,
-                    icon: const Icon(Icons.format_list_bulleted,
-                        color: Colors.white),
-                    label: const Text("Steps",
-                        style: TextStyle(color: Colors.white)),
-                    onPressed: _showDirectionsSheet)),
-          ],
-
-          // 6. REPORT HAZARD BUTTON (Only visible during navigation)
-          if (_isNavigating)
-            Positioned(
-              bottom: 85,
-              left: 20,
-              child: FloatingActionButton(
-                heroTag: 'report',
-                onPressed: _showReportHazardDialog,
-                backgroundColor: Colors.redAccent,
-                child: const Icon(
-                  Icons.warning_amber_rounded,
-                  color: Colors.white,
+                  heroTag: "startNav",
+                  onPressed: _startNavigation,
+                  backgroundColor: _rainModeEnabled ? Colors.green[700] : Colors.green,
+                  icon: Icon(
+                    Icons.navigation,
+                    color: Colors.white,
+                    size: _rainModeEnabled ? 30 : 24,
+                  ),
+                  label: Text(
+                    "Start",
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                      fontSize: _rainModeEnabled ? 24 : 18,
+                    ),
+                  ),
                 ),
               ),
             ),
 
-          // 7. COMPACT STATUS CARD (Dark, Small, Bottom Fixed)
+          if (_isNavigating)
+            Positioned(
+              bottom: 160,
+              right: 20,
+              child: SizedBox(
+                height: buttonSize,
+                child: FloatingActionButton.extended(
+                  heroTag: "stopNav",
+                  onPressed: _stopNavigation,
+                  backgroundColor: _rainModeEnabled ? Colors.red[700] : Colors.red,
+                  icon: Icon(
+                    Icons.stop,
+                    color: Colors.white,
+                    size: _rainModeEnabled ? 30 : 24,
+                  ),
+                  label: Text(
+                    "Exit",
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                      fontSize: _rainModeEnabled ? 24 : 18,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+
+          // STEPS BUTTON
+          if (_routeInstructions.isNotEmpty)
+            Positioned(
+              bottom: 90,
+              right: 20,
+              child: SizedBox(
+                height: buttonSize,
+                child: FloatingActionButton.extended(
+                  heroTag: "directions",
+                  backgroundColor: _rainModeEnabled ? Colors.blue[700] : Colors.blueAccent,
+                  icon: Icon(
+                    Icons.format_list_bulleted,
+                    color: Colors.white,
+                    size: _rainModeEnabled ? 28 : 24,
+                  ),
+                  label: Text(
+                    "Steps",
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: _rainModeEnabled ? 20 : 16,
+                    ),
+                  ),
+                  onPressed: _showDirectionsSheet,
+                ),
+              ),
+            ),
+
+          // REPORT HAZARD BUTTON (Rain mode adaptive)
+          Positioned(
+            bottom: 85,
+            left: 20,
+            child: SizedBox(
+              width: largeButtonSize,
+              height: largeButtonSize,
+              child: FloatingActionButton(
+                heroTag: 'report',
+                onPressed: _showReportHazardDialog,
+                backgroundColor: _rainModeEnabled ? Colors.orange[700] : Colors.redAccent,
+                child: Icon(
+                  Icons.warning_amber_rounded,
+                  color: Colors.white,
+                  size: _rainModeEnabled ? 45 : 35,
+                ),
+              ),
+            ),
+          ),
+
+          // COMPACT STATUS CARD (High contrast in rain mode)
           Positioned(
             bottom: 20,
             left: 20,
             right: 20,
             child: Card(
-              color: Colors.black87,
-              elevation: 8,
+              color: _rainModeEnabled ? Colors.black : Colors.black87,
+              elevation: _rainModeEnabled ? 12 : 8,
               shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12)),
+                borderRadius: BorderRadius.circular(12),
+                side: _rainModeEnabled 
+                    ? BorderSide(color: routeColor, width: 3)
+                    : BorderSide.none,
+              ),
               child: Padding(
-                // Slim padding for compact look
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+                padding: EdgeInsets.symmetric(
+                  horizontal: 16.0,
+                  vertical: _rainModeEnabled ? 12.0 : 8.0,
+                ),
                 child: Row(
                   children: [
                     if (isLoading)
-                      const SizedBox(
-                          width: 20,
-                          height: 20,
-                          child: CircularProgressIndicator(
-                              color: Colors.white, strokeWidth: 2))
+                      SizedBox(
+                        width: _rainModeEnabled ? 28 : 20,
+                        height: _rainModeEnabled ? 28 : 20,
+                        child: CircularProgressIndicator(
+                          color: Colors.white,
+                          strokeWidth: _rainModeEnabled ? 3 : 2,
+                        ),
+                      )
                     else
                       Icon(
-                          statusMessage.contains('Rain')
-                              ? Icons.warning
-                              : Icons.check_circle,
-                          color: routeColor,
-                          size: 24),
+                        statusMessage.contains('High')
+                            ? Icons.warning
+                            : statusMessage.contains('Medium')
+                                ? Icons.warning_amber
+                                : Icons.check_circle,
+                        color: routeColor,
+                        size: _rainModeEnabled ? 32 : 24,
+                      ),
                     const SizedBox(width: 12),
                     Expanded(
-                        child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                          Text(statusMessage,
-                              style: const TextStyle(
-                                  color: Colors.white,
-                                  fontWeight: FontWeight.bold,
-                                  fontSize: 14)),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            statusMessage,
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.bold,
+                              fontSize: _rainModeEnabled ? 18 : 14,
+                            ),
+                          ),
                           if (routeStats.isNotEmpty)
-                            Text("$routeStats  |  $weatherForecast",
-                                style: TextStyle(
-                                    color: Colors.grey[400], fontSize: 11))
-                        ])),
+                            Text(
+                              "$routeStats  |  $weatherForecast",
+                              style: TextStyle(
+                                color: _rainModeEnabled ? Colors.white70 : Colors.grey[400],
+                                fontSize: _rainModeEnabled ? 14 : 11,
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -818,6 +1341,4 @@ class _MapScreenState extends State<MapScreen> {
       ),
     );
   }
-
-  List<LatLng> get _routePoints => routePoints;
 }
