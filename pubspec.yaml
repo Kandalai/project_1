@@ -33,6 +33,13 @@ dependencies:
   # --- Branding ---
   flutter_launcher_icons: ^0.14.4
   flutter_native_splash: ^2.4.0 
+  firebase_auth: ^5.7.0
+
+  dependencies:
+  flutter:
+    sdk: flutter
+  firebase_core: ^3.0.0  # Ensure this is also present
+  firebase_auth: ^5.0.0  # Add this line
 
 dev_dependencies:
   flutter_test:
