@@ -10,10 +10,10 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # Firebase Core
-  firebase_core: ^2.24.2
-  firebase_auth: ^4.16.0
-  cloud_firestore: ^4.14.0
+  # Firebase
+  firebase_core: ^3.1.0
+  firebase_auth: ^5.7.0
+  cloud_firestore: ^5.0.1
 
   # Location & Maps
   geolocator: ^10.1.0
