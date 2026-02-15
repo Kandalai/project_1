@@ -1,10 +1,16 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:firebase_auth/firebase_auth.dart'; // For User ID
+import 'package:cloud_firestore/cloud_firestore.dart'; // For User Name
 import 'dart:async'; // For Timer
+import 'dart:math'; // For min function
 import 'dart:ui'; // For ImageFilter
 import 'map_screen.dart';
 import '../services/api_service.dart';
+import '../services/api_service.dart';
 import '../theme/app_theme.dart';
+import 'settings_screen.dart';
+import 'package:project_1/services/localization_service.dart'; // Import Service
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -16,11 +22,13 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateMixin {
   final ApiService api = ApiService();
   final _searchController = TextEditingController();
+  final _loc = LocalizationService(); // Localization
   
   late AnimationController _animController;
   late Animation<double> _fadeAnim;
 
   // Real Data State
+  String _displayId = "Guest"; // Default to Guest
   Map<String, dynamic>? _weatherData;
   List<String> _searchHistory = [];
   List<SearchResult> _searchResults = [];
@@ -52,6 +60,39 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   }
 
   Future<void> _loadData() async {
+    // 0. Fetch User Info (Name or ID)
+    try {
+      final user = FirebaseAuth.instance.currentUser;
+      if (user != null) {
+        String displayName = "Guest";
+        
+        // A. Try Auth Profile Name
+        if (user.displayName != null && user.displayName!.isNotEmpty) {
+          displayName = user.displayName!;
+        } 
+        // B. Try Firestore Profile Name
+        else if (!user.isAnonymous) {
+             final doc = await FirebaseFirestore.instance.collection('users').doc(user.uid).get();
+             if (doc.exists && doc.data()!.containsKey('name')) {
+               displayName = doc.data()!['name'];
+             }
+        }
+        
+        // C. Fallback to ID
+        if (displayName == "Guest" && !user.isAnonymous) {
+           displayName = "ID: ${user.uid.substring(0, min(6, user.uid.length))}...";
+        }
+
+        if (mounted) {
+            setState(() {
+                _displayId = displayName; // Now holds "Name" or "ID: 123..."
+            });
+        }
+      }
+    } catch (e) {
+      print("Error fetching user info: $e");
+    }
+
     // 1. Fetch History
     final history = await api.getSearchHistory();
     if (mounted) setState(() => _searchHistory = history);
@@ -96,11 +137,14 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   }
 
   void _navigateToMap(String destination) async {
-      // 1. Get coords
+      // 1. Save to history
+      await api.addToHistory(destination);
+
+      // 2. Get coords
       final coords = await api.getCoordinates(destination);
       if (coords != null && mounted) {
-           // 2. Push Map Screen
-           Navigator.push(
+           // 3. Push Map Screen and refresh history on return
+           await Navigator.push(
                context,
                MaterialPageRoute(
                    builder: (_) => MapScreen(
@@ -110,6 +154,9 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                    ),
                ),
            );
+           // 4. Refresh search history when user comes back
+           final history = await api.getSearchHistory();
+           if (mounted) setState(() => _searchHistory = history);
       }
   }
 
@@ -164,8 +211,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                     const SizedBox(height: 32),
 
                     // SAVED ROUTES TITLE
-                    const Text(
-                      "RECENT SEARCHES",
+                    Text(
+                      _loc.get('recent_searches'),
                       style: TextStyle(
                         color: Colors.white,
                         fontSize: 14,
@@ -190,7 +237,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
           // 4. SEARCH RESULTS OVERLAY
           if (_isSearching && _searchResults.isNotEmpty)
             Positioned(
-              top: 160, 
+              top: 260, // Adjusted to sit below the search bar 
               left: 24, 
               right: 24,
               bottom: 0,
@@ -261,34 +308,43 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              "Good Evening,",
+              _loc.get('welcome'),
               style: TextStyle(
                 color: Colors.white.withValues(alpha: 0.6),
                 fontSize: 16,
               ),
             ),
             const SizedBox(height: 4),
-            const Text(
-              "Kandalai", // Placeholder user name
-              style: TextStyle(
+            Text(
+              _displayId, 
+              style: const TextStyle(
                 color: Colors.white,
-                fontSize: 28,
+                fontSize: 24, // Slightly smaller to fit ID
                 fontWeight: FontWeight.bold,
                 letterSpacing: 0.5,
               ),
             ),
           ],
         ),
-        Container(
-          width: 48,
-          height: 48,
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            color: Colors.white.withValues(alpha: 0.1),
-            border: Border.all(color: Colors.white24),
-            image: const DecorationImage(
-              image: NetworkImage("https://i.pravatar.cc/150?img=12"), // Placeholder Avatar
-              fit: BoxFit.cover,
+        GestureDetector(
+          onTap: () async {
+            await Navigator.push(
+              context, 
+              MaterialPageRoute(builder: (context) => const SettingsScreen())
+            );
+            _loadData(); // Refresh name upon return
+          },
+          child: Container(
+            width: 48,
+            height: 48,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: Colors.white.withValues(alpha: 0.1),
+              border: Border.all(color: Colors.white24),
+              image: const DecorationImage(
+                image: NetworkImage("https://i.pravatar.cc/150?img=12"), // Placeholder Avatar
+                fit: BoxFit.cover,
+              ),
             ),
           ),
         ),
@@ -302,7 +358,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       decoration: BoxDecoration(
         color: Colors.white.withValues(alpha: 0.05),
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.1)),
+        border: Border.all(color: const Color(0xFF00F0FF).withValues(alpha: 0.15)),
         boxShadow: [
           BoxShadow(
             color: Colors.black.withValues(alpha: 0.2),
@@ -314,27 +370,32 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       padding: const EdgeInsets.symmetric(horizontal: 16),
       child: Row(
         children: [
-          const Icon(Icons.search, color: Colors.white54),
-          const SizedBox(width: 12),
           Expanded(
             child: TextField(
               controller: _searchController,
               style: const TextStyle(color: Colors.white),
-              decoration: const InputDecoration(
-                hintText: "Where to?",
-                hintStyle: TextStyle(color: Colors.white38),
+              decoration: InputDecoration(
+                hintText: _loc.get('search_hint'),
+                hintStyle: const TextStyle(color: Colors.white38),
                 border: InputBorder.none,
               ),
+              onSubmitted: (value) {
+                if (value.trim().isNotEmpty) {
+                  _navigateToMap(value.trim());
+                }
+              },
             ),
           ),
-          Container(
-            padding: const EdgeInsets.all(8),
-            decoration: BoxDecoration(
-              color: const Color(0xFF00F0FF).withValues(alpha: 0.1),
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: const Icon(Icons.mic, color: Color(0xFF00F0FF), size: 20),
+          const SizedBox(width: 12),
+          GestureDetector(
+             onTap: () {
+               if (_searchController.text.trim().isNotEmpty) {
+                 _navigateToMap(_searchController.text.trim());
+               }
+             },
+             child: const Icon(Icons.search, color: Colors.white54),
           ),
+
         ],
       ),
     );
@@ -378,8 +439,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                   Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Text(
-                        "CURRENT CONDITIONS",
+                      Text(
+                        _loc.get('current_cond'),
                         style: TextStyle(
                           color: Colors.white54,
                           fontSize: 12,
@@ -476,8 +537,12 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       width: 160,
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: const Color(0xFF1E293B).withValues(alpha: 0.5),
         borderRadius: BorderRadius.circular(20),
+        gradient: const LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [Color(0xFF1E293B), Color(0xFF0F172A)],
+        ),
         border: Border.all(
              color: isSafe ? const Color(0xFF00FF9D).withValues(alpha: 0.3) : Colors.white10
         ),
@@ -558,13 +623,13 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
           ),
           child: Container(
             alignment: Alignment.center,
-            child: const Row(
+            child: Row(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
                 Icon(Icons.search, color: Colors.white, size: 22),
                 SizedBox(width: 10),
                 Text(
-                  "SEARCH DESTINATION",
+                  _loc.get('search_btn'),
                   style: TextStyle(
                     color: Colors.white,
                     fontSize: 16,

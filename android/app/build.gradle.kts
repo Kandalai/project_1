@@ -1,9 +1,8 @@
 plugins {
     id("com.android.application")
-    id("kotlin-android")
+    id("org.jetbrains.kotlin.android")
     id("dev.flutter.flutter-gradle-plugin")
-    id("com.google.gms.google-services") // This is correct}
-// REMOVE the extra plugins block you had at the bottom of this file
+    id("com.google.gms.google-services")
 }
 android {
     namespace = "com.example.project_1"

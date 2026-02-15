@@ -19,6 +19,7 @@ import '../widgets/vehicle_marker.dart'; // Added Vehicle Marker
 import '../widgets/language_selector.dart'; // Language Selector
 import '../widgets/premium_bottom_sheet.dart'; // Premium Bottom Sheet
 import '../widgets/weather_overlay.dart'; // Immersive Weather Animations
+import '../services/localization_service.dart'; // Added Localization Service
 
 import '../theme/app_theme.dart';
 
@@ -61,6 +62,7 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
   final ApiService api = ApiService();
   final MapController mapController = MapController();
   final FlutterTts flutterTts = FlutterTts();
+
   final Stream<QuerySnapshot> _hazardStream = FirebaseFirestore.instance
       .collection('hazards')
       .where('expiresAt', isGreaterThan: DateTime.now())
@@ -77,7 +79,6 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
   Timer? _mapSearchDebounce;
 
   // STATE VARIABLES
-  // STATE VARIABLES
   StreamSubscription<Position>? _positionSub;
   StreamSubscription<CompassEvent>? _compassSub; // Compass subscription
   LatLng? _lastRouteCalcPosition;
@@ -86,14 +87,7 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
 
   // VEHICLE MODE & SETTINGS
   VehicleType _selectedVehicle = VehicleType.bike;
-  String _selectedLanguage = 'en-IN'; // English-India default (ENGLISH FALLBACK)
-  final Map<String, String> _languageNames = const {
-    'en-IN': 'English',
-    'hi-IN': 'हिंदी (Hindi)',
-    'te-IN': 'తెలుగు (Telugu)',
-    'ta-IN': 'தமிழ் (Tamil)',
-    'kn-IN': 'ಕನ್ನಡ (Kannada)',
-  };
+  // Language is now handled globally via LocalizationService
 
   // Settings
   final double _recalcThresholdMeters = 50.0;
@@ -112,7 +106,8 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
   bool _isNavigating = false;
   int _currentStepIndex = 0;
   bool _hasSpokenCurrentStep = false;
-  bool _voiceAssistantEnabled = false; // Voice Assistant Toggle (Default OFF)
+  bool _voiceAssistantEnabled = true; // Voice Assistant Default ON
+
 
   // Map Data
   LatLng? _startCoord;
@@ -120,6 +115,7 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
   RouteModel? _currentRoute;
   List<RouteModel> _alternativeRoutes = []; // Store alternatives
   List<LatLng> routePoints = [];
+  List<Polyline> _routeSegments = []; // NEW: Segmented route
   List<Marker> _weatherMarkers = [];
   List<Marker> _dipMarkers = [];
 
@@ -137,17 +133,19 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
   bool isLoading = false;
   bool hasError = false;
 
+  late AnimationController _weatherController;
+  String _activeWeatherMode = 'clear';
+
   @override
   void initState() {
     super.initState();
     _startController = TextEditingController(text: widget.startPoint);
     _endController = TextEditingController(text: widget.endPoint);
-
+    
     _initVoice();
 
     _startController.addListener(() {
-      if (_startController.text.trim() == "Current Location" &&
-          _liveTrackingEnabled) {
+      if (_startController.text.trim() == "Current Location" && _liveTrackingEnabled) {
         _startLiveTracking();
       } else {
         _stopLiveTracking();
@@ -178,25 +176,36 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
     _activeWeatherMode = widget.simulateWeather ?? 'clear';
   }
 
-  late AnimationController _weatherController;
-  String _activeWeatherMode = 'clear';
-
-  /// Initializes the text-to-speech engine.
-  /// 
-  /// ENGLISH FALLBACK: Defaults to English-India, ensuring tourists can use the app.
+  /// Initializes the text-to-speech engine based on global language.
   void _initVoice() async {
     try {
-      await flutterTts.setLanguage(_selectedLanguage);
-      await flutterTts.setSpeechRate(1.1); // Fast, clear speech
+      // 1. Get Global App Language
+      String appLang = LocalizationService().currentLanguage;
+      
+      // 2. Map to TTS Locale
+      String ttsLocale = 'en-IN'; // Default
+      switch (appLang) {
+        case 'Hindi': ttsLocale = 'hi-IN'; break;
+        case 'Telugu': ttsLocale = 'te-IN'; break;
+        case 'Tamil': ttsLocale = 'ta-IN'; break;
+        default: ttsLocale = 'en-IN';
+      }
+
+      // 3. Set TTS Language
+      await flutterTts.setLanguage(ttsLocale);
+      await flutterTts.setSpeechRate(0.5); // Slow, clear speech
       await flutterTts.setVolume(1.0);
       await flutterTts.setPitch(1.0);
+      
     } catch (e) {
       // Fallback to English if selected language fails
       await flutterTts.setLanguage('en-IN');
-      await flutterTts.setSpeechRate(1.1);
+      await flutterTts.setSpeechRate(0.5);
       ErrorHandler.logError('MapScreen', 'TTS initialization error, falling back to English: $e');
     }
   }
+
+
 
   /// Restores saved route if available (Offline capabilities).
   Future<void> _checkForSavedRoute() async {
@@ -294,10 +303,12 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
   void dispose() {
     _stopLiveTracking();
     _startController.dispose();
+    flutterTts.stop();
     _endController.dispose();
     _mapSearchController.dispose();
     _mapSearchDebounce?.cancel();
     flutterTts.stop();
+
     _weatherController.dispose();
     super.dispose();
   }
@@ -311,7 +322,7 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
       });
       return;
     }
-    _mapSearchDebounce = Timer(const Duration(milliseconds: 400), () async {
+    _mapSearchDebounce = Timer(const Duration(milliseconds: 300), () async {
       final results = await api.getPlaceSuggestions(query);
       if (mounted) {
         setState(() {
@@ -350,7 +361,6 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
   void _toggleRainMode() {
     HapticFeedback.heavyImpact();
     setState(() => _rainModeEnabled = !_rainModeEnabled);
-    _speak(_rainModeEnabled ? "Rain mode activated" : "Rain mode deactivated");
   }
 
   // VOICE ASSISTANT TOGGLE
@@ -407,76 +417,13 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                   width: _selectedVehicle == vehicle ? 2 : 1,
                 ),
               ),
-              onTap: () {
-                HapticFeedback.mediumImpact(); // HAPTIC FEEDBACK
-                setState(() => _selectedVehicle = vehicle);
-                Navigator.pop(ctx);
-                _speak('Vehicle changed to ${vehicle.displayName}');
-              },
-            );
-          }).toList(),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Close', style: TextStyle(color: Colors.blue)),
-          ),
-        ],
-      ),
-    );
-  }
-
-  // ===============================================================
-  // LANGUAGE SELECTION DIALOG
-  // ===============================================================
-  /// Shows a dialog to select voice language.
-  /// 
-  /// ENGLISH FALLBACK: English is always first in the list.
-  void _showLanguageSelectionDialog() {
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: AppColors.surface,
-        title: const Text(
-          'Voice Language',
-          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-        ),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: _languageNames.entries.map((entry) {
-            return ListTile(
-              title: Text(
-                entry.value,
-                style: const TextStyle(color: Colors.white),
-              ),
-              tileColor: _selectedLanguage == entry.key
-                  ? Colors.blue.withValues(alpha: 0.1)
-                  : null,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(10),
-                side: BorderSide(
-                  color: _selectedLanguage == entry.key 
-                      ? Colors.blue 
-                      : Colors.grey.shade300,
-                  width: _selectedLanguage == entry.key ? 2 : 1,
-                ),
-              ),
-              onTap: () async {
-                HapticFeedback.mediumImpact(); // HAPTIC FEEDBACK
-                setState(() => _selectedLanguage = entry.key);
-                try {
-                  await flutterTts.setLanguage(_selectedLanguage);
-                } catch (e) {
-                  // ENGLISH FALLBACK if language not supported
-                  await flutterTts.setLanguage('en-IN');
-                  ErrorHandler.logError('MapScreen', 'Language not supported, falling back to English');
-                }
-                if (!ctx.mounted) return;
-                Navigator.pop(ctx);
-                _speak('Language changed');
-              },
-            );
-          }).toList(),
+                onTap: () {
+                  HapticFeedback.mediumImpact(); // HAPTIC FEEDBACK
+                  setState(() => _selectedVehicle = vehicle);
+                  Navigator.pop(ctx);
+                },
+              );
+            }).toList(),
         ),
         actions: [
           TextButton(
@@ -845,25 +792,17 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
     }
   }
 
-  /// Speaks text using text-to-speech with English fallback.
+
+
   /// Speaks text using text-to-speech with English fallback.
   Future<void> _speak(String text) async {
     if (!_voiceAssistantEnabled) return; // Respect toggle
 
     try {
-      // Always sync language before speaking
-      await flutterTts.setLanguage(_selectedLanguage);
-      await flutterTts.setSpeechRate(1.1);
+      await flutterTts.setSpeechRate(0.5);
       await flutterTts.speak(text);
     } catch (e) {
-      // ENGLISH FALLBACK: Try English if selected language fails
-      try {
-        await flutterTts.setLanguage('en-IN');
-        await flutterTts.setSpeechRate(1.1);
-        await flutterTts.speak(text);
-      } catch (fallbackError) {
-        ErrorHandler.logError('MapScreen', 'TTS error even with English fallback: $fallbackError');
-      }
+      ErrorHandler.logError('MapScreen', 'TTS error: $e');
     }
   }
 
@@ -1005,8 +944,12 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
               : await api.getCoordinates(startText);
       }
 
-      LatLng? eCoord = widget.endCoords;
-      if (eCoord == null) {
+      LatLng? eCoord;
+      // OPTIMIZATION: Use passed coords ONLY if they match current text
+      if (widget.endCoords != null && endText == widget.endPoint) {
+          eCoord = widget.endCoords;
+      } else {
+          // Otherwise geocode the new text (User searched for something new)
           eCoord = await api.getCoordinates(endText);
       }
 
@@ -1024,10 +967,22 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
       if (!isRefetch) await api.addToHistory(endText);
 
       // Get Vehicle-Specific Routes (Alternatives)
+      // Extract locale code (e.g., 'hi' from 'hi-IN')
+      // Since we don't have _selectedLanguage anymore, we derive it from LocalizationService
+      String appLang = LocalizationService().currentLanguage;
+      String localeCode = 'en';
+      switch (appLang) {
+        case 'Hindi': localeCode = 'hi'; break;
+        case 'Telugu': localeCode = 'te'; break;
+        case 'Tamil': localeCode = 'ta'; break;
+        default: localeCode = 'en';
+      }
+      
       final List<RouteModel> allRoutes = await api.getSafeRoutesOptions(
         sCoord,
         eCoord,
         vehicleType: _selectedVehicle,
+        locale: localeCode, // Pass language code
       );
 
       if (allRoutes.isEmpty) {
@@ -1090,23 +1045,36 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
 
       // Create weather markers
       final List<Marker> newWeatherMarkers = bestRoute.weatherAlerts.map<Marker>((alert) {
+        // DYNAMIC ICON LOGIC
+        IconData weatherIcon = Icons.cloud;
+        Color iconColor = _rainModeEnabled ? Colors.lightBlueAccent : Colors.blue;
+        
+        final desc = alert.description.toLowerCase();
+        if (desc.contains('storm') || desc.contains('thunder')) {
+          weatherIcon = Icons.thunderstorm;
+          iconColor = Colors.deepPurpleAccent;
+        } else if (desc.contains('rain') || desc.contains('drizzle') || desc.contains('shower')) {
+          weatherIcon = Icons.water_drop;
+          iconColor = Colors.blueAccent;
+        }
+
         return Marker(
           point: alert.point,
-          width: 80,
-          height: 80,
+          width: 60, // Reduced width
+          height: 60, // Reduced height
           child: Column(
+            mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(Icons.cloud, color: _rainModeEnabled ? Colors.lightBlueAccent : Colors.blue, size: 30),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-                decoration: BoxDecoration(
+              Icon(weatherIcon, color: iconColor, size: 24), // Smaller icon
+              Text(
+                '${alert.temperature.toStringAsFixed(0)}°C',
+                style: const TextStyle(
+                  fontSize: 10, 
+                  fontWeight: FontWeight.bold, 
                   color: Colors.white,
-                  borderRadius: BorderRadius.circular(4),
-                  border: Border.all(color: Colors.grey.shade300),
-                ),
-                child: Text(
-                  '${alert.temperature.toStringAsFixed(0)}°',
-                  style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.black87),
+                  shadows: [
+                    Shadow(offset: Offset(0, 1), blurRadius: 2, color: Colors.black),
+                  ],
                 ),
               ),
             ],
@@ -1146,7 +1114,7 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
       if (mounted) {
         setState(() {
           _currentRoute = bestRoute;
-          routePoints = bestRoute.points;
+          routePoints = _simplifyRoute(bestRoute.points);
           _weatherMarkers = newWeatherMarkers;
           _dipMarkers = newDipMarkers;
           _routeInstructions = instructions;
@@ -1154,13 +1122,102 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
           _hasSpokenCurrentStep = false;
           isLoading = false;
 
+          // SEGMENTED COLORING LOGIC
+          // Create segments based on local weather instead of one global color
+          _routeSegments = [];
+          List<LatLng> currentSegment = [];
+          Color currentColor = Colors.transparent;
+          const Distance distCalc = Distance();
+          
+          // Default safe color
+          final Color safeColor = const Color(0xFF10B981).withValues(alpha: 0.7);
+
+          if (bestRoute.points.isNotEmpty) {
+             currentColor = safeColor;
+             // If we have no weather data, the whole route is safe/default
+             if (bestRoute.weatherAlerts.isEmpty) {
+                _routeSegments.add(Polyline(
+                  points: bestRoute.points, 
+                  color: safeColor, 
+                  strokeWidth: 6.0
+                ));
+             } else {
+               // Process points
+               for (int i = 0; i < bestRoute.points.length; i++) {
+                  final point = bestRoute.points[i];
+                  
+                  // Find nearest weather alert
+                  WeatherAlert? nearest;
+                  double minDistance = double.infinity;
+                  
+                  for (final alert in bestRoute.weatherAlerts) {
+                     final d = distCalc.as(LengthUnit.Meter, point, alert.point);
+                     if (d < minDistance) {
+                       minDistance = d;
+                       nearest = alert;
+                     }
+                  }
+                  
+                  // Determine color for this point
+                  Color pointColor = safeColor;
+                  final double rainIntensity = nearest?.rainIntensity ?? 0.0;
+                  
+                  // Dynamic Radius: Approx half the distance between samples
+                  // If we use 10-40 samples, the spacing varies.
+                  // distKm / samples = spacing. Radius = spacing * 0.6
+                  final double sampleSpacingKm = (bestRoute.distanceMeters / 1000) / bestRoute.weatherAlerts.length; 
+                  final double dynamicRadius = (sampleSpacingKm * 1000 * 0.6).clamp(5000, 50000); // Min 5km, Max 50km
+
+                  if (nearest != null && minDistance < dynamicRadius) {
+                      if (nearest.description.toLowerCase().contains('storm') || 
+                          nearest.description.toLowerCase().contains('thunder') ||
+                          rainIntensity > 10.0) {
+                          pointColor = Colors.red.withValues(alpha: 0.7);
+                      } else if (rainIntensity > 0 || 
+                                 nearest.description.toLowerCase().contains('rain') ||
+                                 nearest.description.toLowerCase().contains('drizzle')) {
+                          pointColor = Colors.red.withValues(alpha: 0.7); // User requested RED for rain
+                      }
+                  }
+                  
+                  if (currentSegment.isEmpty) {
+                     currentColor = pointColor;
+                     currentSegment.add(point);
+                  } else if (pointColor == currentColor) {
+                     currentSegment.add(point);
+                  } else {
+                     // Color changed! Finish old segment
+                     currentSegment.add(point); // Add overlap point for continuity/smoothness
+                     _routeSegments.add(Polyline(
+                        points: List.from(currentSegment),
+                        color: currentColor,
+                        strokeWidth: 6.0,
+                     ));
+                     
+                     // Start new segment
+                     currentSegment = [point];
+                     currentColor = pointColor;
+                  }
+               }
+               
+               // Add final segment
+               if (currentSegment.isNotEmpty) {
+                  _routeSegments.add(Polyline(
+                     points: List.from(currentSegment),
+                     color: currentColor,
+                     strokeWidth: 6.0,
+                  ));
+               }
+             }
+          }
+
           // Risk-based Coloring (Semi-transparent to show Traffic Layer underneath)
           if (bestRoute.riskLevel == 'High') {
             routeColor = Colors.red.withValues(alpha: 0.6);
           } else if (bestRoute.riskLevel == 'Medium') {
             routeColor = Colors.orange.withValues(alpha: 0.6);
           } else {
-            routeColor = Colors.blue.withValues(alpha: 0.6); // Safe route (Blue)
+            routeColor = safeColor; // Safe route (Green)
           }
 
           // AUTOMATIC WEATHER ANIMATION TRIGGER
@@ -1371,6 +1428,22 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
     mapController.move(centerPos, 17.0);
   }
 
+  /// Simplifies a route polyline by keeping every Nth point.
+  /// Dramatically improves rendering performance (10K -> ~500 points).
+  List<LatLng> _simplifyRoute(List<LatLng> points, {int maxPoints = 500}) {
+    if (points.length <= maxPoints) return points;
+    final step = (points.length / maxPoints).ceil();
+    final simplified = <LatLng>[];
+    for (int i = 0; i < points.length; i += step) {
+      simplified.add(points[i]);
+    }
+    // Always include the last point
+    if (simplified.last != points.last) {
+      simplified.add(points.last);
+    }
+    return simplified;
+  }
+
   /// Shows a bottom sheet with turn-by-turn directions.
   void _showDirectionsSheet() {
     if (_routeInstructions.isEmpty) return;
@@ -1401,7 +1474,7 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                   width: 40,
                   height: 5,
                   decoration: BoxDecoration(
-                    color: Colors.grey[300],
+                    color: Colors.white30,
                     borderRadius: BorderRadius.circular(10),
                   ),
                 ),
@@ -1410,14 +1483,14 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                     style: TextStyle(
                         fontSize: 20,
                         fontWeight: FontWeight.bold,
-                        color: Colors.black87)),
-                Divider(color: Colors.grey[300], height: 20),
+                        color: Colors.white)),
+                Divider(color: Colors.white24, height: 20),
                 Expanded(
                   child: ListView.separated(
                     controller: scrollController,
                     itemCount: _routeInstructions.length,
                     separatorBuilder: (_, __) =>
-                        Divider(height: 1, color: Colors.grey[200]),
+                        Divider(height: 1, color: Colors.white10),
                     itemBuilder: (ctx, index) {
                       final step = _routeInstructions[index];
                       final String instruction = step['instruction']
@@ -1453,7 +1526,7 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                                     ? FontWeight.bold
                                     : FontWeight.normal)),
                         subtitle: Text("${step['distance']} m",
-                            style: TextStyle(color: Colors.grey[600], fontSize: 12)),
+                            style: const TextStyle(color: Colors.white38, fontSize: 12)),
                       );
                     },
                   ),
@@ -1559,8 +1632,10 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                      );
                    }),
                    
-                   // 2. SELECTED ROUTE (Blue/Primary)
-                   if (routePoints.isNotEmpty)
+                   // 2. SELECTED ROUTE (Segmented & Colored)
+                   if (_routeSegments.isNotEmpty)
+                      ..._routeSegments
+                   else if (routePoints.isNotEmpty)
                      Polyline(
                        points: routePoints,
                        strokeWidth: 6.0,
@@ -1817,16 +1892,10 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                            ),
                          ),
                          const SizedBox(width: 8),
-                          _buildHeaderAction(
+                         _buildHeaderAction(
                             icon: _rainModeEnabled ? Icons.water_drop : Icons.wb_sunny,
                             isActive: _rainModeEnabled,
                             onTap: _toggleRainMode,
-                          ),
-                          const SizedBox(width: 8),
-                          _buildHeaderAction(
-                            icon: Icons.translate,
-                            isActive: false,
-                            onTap: _showLanguageSelector,
                           ),
                         ],
                      ),
@@ -1859,8 +1928,6 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                    child: Row(
                      children: [
                        const SizedBox(width: 14),
-                       const Icon(Icons.search, color: Colors.white38, size: 20),
-                       const SizedBox(width: 10),
                        Expanded(
                          child: TextField(
                            controller: _mapSearchController,
@@ -1880,6 +1947,9 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                            },
                          ),
                        ),
+                       const SizedBox(width: 10),
+                       const Icon(Icons.search, color: Colors.white38, size: 20),
+                       const SizedBox(width: 14),
                        if (_mapSearchController.text.isNotEmpty)
                          GestureDetector(
                            onTap: () {
@@ -1941,8 +2011,52 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                ],
              ),
            ),
+            // MAP LEGEND (Top Left, below search)
+            if (!_isMapSearching)
+              Positioned(
+              top: MediaQuery.of(context).padding.top + 130,
+              left: 16,
+              child: Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF0F172A).withValues(alpha: 0.9),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.white.withValues(alpha: 0.1)),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withValues(alpha: 0.3),
+                      blurRadius: 10,
+                    ),
+                  ],
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      "LEGEND",
+                      style: TextStyle(
+                        color: Colors.white54,
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 1,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    _buildLegendItem(color: const Color(0xFF10B981), label: "Safe Route"),
+                    const SizedBox(height: 4),
+                    _buildLegendItem(icon: Icons.water_drop, iconColor: Colors.blueAccent, label: "Weather Checkpoint"),
+                    const SizedBox(height: 4),
+                    _buildLegendItem(color: Colors.red, label: "Rain / Risk"),
+                    const SizedBox(height: 4),
+                    _buildLegendItem(icon: Icons.arrow_downward, iconColor: Colors.orange, label: "Steep Dip"),
+                    const SizedBox(height: 4),
+                    _buildLegendItem(icon: Icons.flood, iconColor: const Color(0xFF2962FF), label: "Waterlogging"),
+                  ],
+                ),
+              ),
+            ),
            Positioned(
-             bottom: (_alternativeRoutes.length > 1 && !_isNavigating) ? 330 : 250,
+             bottom: (_alternativeRoutes.length > 1 && !_isNavigating) ? 210 : 130,
              right: 16,
              child: Column(
                mainAxisSize: MainAxisSize.min,
@@ -2098,7 +2212,7 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
 
           // REPORT HAZARD BUTTON (Rain mode adaptive)
           Positioned(
-            bottom: (_alternativeRoutes.length > 1 && !_isNavigating) ? 330 : 250,
+            bottom: (_alternativeRoutes.length > 1 && !_isNavigating) ? 210 : 130, // Lowered buttons
             left: 20,
             child: SizedBox(
               width: largeButtonSize,
@@ -2119,11 +2233,11 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
           // ROUTE SELECTION (Premium Cards)
           if (_alternativeRoutes.length > 1 && !_isNavigating)
             Positioned(
-              bottom: 240, // ABOVE Bottom Sheet
+              bottom: 140, // Lowered significantly (240 -> 140) to sit above bottom sheet
               left: 0,
               right: 0,
               child: SizedBox(
-                height: 80,
+                height: 64, // Reduced height (80 -> 64)
                 child: ListView.builder(
                   scrollDirection: Axis.horizontal,
                   padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -2148,17 +2262,17 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                            setState(() => _selectRoute(route));
                          },
                          child: ClipRRect(
-                           borderRadius: BorderRadius.circular(16),
+                           borderRadius: BorderRadius.circular(12), // Reduced radius
                            child: BackdropFilter(
                              filter: ImageFilter.blur(sigmaX: 8, sigmaY: 8),
                              child: Container(
-                               width: 140,
-                               padding: const EdgeInsets.all(12),
+                               width: 120, // Reduced width
+                               padding: const EdgeInsets.all(10), // Reduced padding
                                decoration: BoxDecoration(
                                  color: isSelected
                                      ? chipColor.withValues(alpha: 0.2)
                                      : const Color(0xFF1E293B).withValues(alpha: 0.8),
-                                 borderRadius: BorderRadius.circular(16),
+                                 borderRadius: BorderRadius.circular(12),
                                  border: Border.all(
                                    color: isSelected ? chipColor : Colors.white.withValues(alpha: 0.1),
                                    width: isSelected ? 1.5 : 1,
@@ -2179,13 +2293,13 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                                          "Route ${index + 1}",
                                          style: TextStyle(
                                            color: Colors.white.withValues(alpha: 0.5),
-                                           fontSize: 10,
+                                           fontSize: 9, // Reduced font
                                            fontWeight: FontWeight.bold,
                                            letterSpacing: 0.5,
                                          ),
                                        ),
                                        Container(
-                                         padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                         padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
                                          decoration: BoxDecoration(
                                            color: chipColor.withValues(alpha: 0.2),
                                            borderRadius: BorderRadius.circular(6),
@@ -2199,12 +2313,12 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                                    ),
                                    Row(
                                      children: [
-                                       Icon(Icons.schedule, size: 12, color: Colors.white.withValues(alpha: 0.6)),
+                                       Icon(Icons.schedule, size: 10, color: Colors.white.withValues(alpha: 0.6)), // Reduced icon
                                        const SizedBox(width: 4),
                                        Flexible(
                                          child: Text(
                                            "${route.durationMinutes} min",
-                                           style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12),
+                                           style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11), // Reduced font
                                            overflow: TextOverflow.ellipsis,
                                          ),
                                        ),
@@ -2212,7 +2326,7 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
                                        Flexible(
                                          child: Text(
                                            "${(route.distanceMeters / 1000).toStringAsFixed(1)} km",
-                                           style: TextStyle(color: Colors.white.withValues(alpha: 0.5), fontSize: 10),
+                                           style: TextStyle(color: Colors.white.withValues(alpha: 0.5), fontSize: 9), // Reduced font
                                            overflow: TextOverflow.ellipsis,
                                          ),
                                        ),
@@ -2287,22 +2401,8 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
     );
   }
 
-  void _showLanguageSelector() async {
-    final selected = await LanguageSelector.show(
-      context,
-      currentLanguage: _selectedLanguage,
-      languageNames: _languageNames,
-    );
-    if (selected != null && selected != _selectedLanguage) {
-      setState(() => _selectedLanguage = selected);
-      // Update TTS language and re-apply speed
-      await flutterTts.setLanguage(selected);
-      await flutterTts.setSpeechRate(1.1);
-      // Confirm with a voice sample
-      final langName = _languageNames[selected] ?? selected;
-      _speak('Language changed to $langName');
-    }
-  }
+
+
 
   Widget _buildHeaderAction({required IconData icon, required bool isActive, required VoidCallback onTap}) {
     return GestureDetector(
@@ -2338,6 +2438,33 @@ class _MapScreenState extends State<MapScreen> with SingleTickerProviderStateMix
       ),
     );
   }
-}
 
+  Widget _buildLegendItem({Color? color, IconData? icon, Color? iconColor, required String label}) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (icon != null)
+          Icon(icon, color: iconColor ?? Colors.white, size: 16)
+        else
+          Container(
+            width: 16,
+            height: 4,
+            decoration: BoxDecoration(
+              color: color,
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+        const SizedBox(width: 8),
+        Text(
+          label,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 12,
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+      ],
+    );
+  }
+}
 

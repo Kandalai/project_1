@@ -2,10 +2,10 @@
 // Supports: flutter_map, geolocator, flutter_tts, shared_preferences, permission_handler
 
 plugins {
-    id("com.android.application")
-    id("kotlin-android")
-    id("dev.flutter.flutter-gradle-plugin")
-    id("com.google.gms.google-services") // This should be here
+    id("com.android.application") apply false
+    id("org.jetbrains.kotlin.android") apply false
+    id("dev.flutter.flutter-gradle-plugin") apply false
+    id("com.google.gms.google-services") apply false
 }
 
 

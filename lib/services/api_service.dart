@@ -2,6 +2,8 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'package:latlong2/latlong.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:async';
 import '../models/route_model.dart';
@@ -78,32 +80,86 @@ class ApiService {
   // 1. SEARCH HISTORY & SUGGESTIONS
   // ==========================================
 
-  /// Saves a successful search query to local phone storage.
+  /// Saves a successful search query to local phone storage AND Cloud.
+  /// Saves a successful search query to local phone storage AND Cloud.
   Future<void> addToHistory(String query) async {
     if (query.trim().isEmpty || query == 'Current Location') return;
 
     try {
+      print("📝 SAVING SEARCH: $query");
+      // 1. Local Save
       final prefs = await SharedPreferences.getInstance();
       final List<String> history = prefs.getStringList('search_history') ?? [];
 
-      // Remove duplicates and keep only latest 10
+      // Avoid duplicates and limit size
       history.removeWhere((item) => item.toLowerCase() == query.toLowerCase());
       history.insert(0, query);
-      if (history.length > 10) {
-        history.removeRange(10, history.length);
+      
+      if (history.length > 20) { // Increased limit
+        history.removeRange(20, history.length);
+      }
+      
+      await prefs.setStringList('search_history', history);
+      print("✅ Local history updated: ${history.length} items");
+
+      // 2. Cloud Save (if logged in)
+      final user = FirebaseAuth.instance.currentUser;
+      if (user != null) {
+        await FirebaseFirestore.instance.collection('users').doc(user.uid).set({
+          'searchHistory': FieldValue.arrayUnion([query]),
+          'lastActive': FieldValue.serverTimestamp(),
+        }, SetOptions(merge: true));
+        print("☁️ Cloud history synced");
       }
 
-      await prefs.setStringList('search_history', history);
     } catch (e) {
       ErrorHandler.logError(_tag, 'Failed to save to history: $e');
     }
   }
 
-  /// Retrieves search history from local storage.
+  /// Retrieves search history from local storage AND Cloud.
   Future<List<String>> getSearchHistory() async {
     try {
+      print("🔍 FETCHING HISTORY...");
+      // 1. Get Local
       final prefs = await SharedPreferences.getInstance();
-      return prefs.getStringList('search_history') ?? [];
+      final localHistory = prefs.getStringList('search_history') ?? [];
+      
+      if (localHistory.isNotEmpty) print("✅ FOUND LOCAL: ${localHistory.length} items");
+
+      // 2. Get Cloud (if logged in)
+      final user = FirebaseAuth.instance.currentUser;
+      if (user != null) {
+        try {
+          final doc = await FirebaseFirestore.instance.collection('users').doc(user.uid).get();
+          if (doc.exists && doc.data()!.containsKey('searchHistory')) {
+            final cloudData = doc.data()!['searchHistory'];
+            if (cloudData is List) {
+               final cloudHistory = cloudData.map((e) => e.toString()).toList();
+               
+               // Merge: Add cloud items to local if not present (case-insensitive)
+               bool changed = false;
+               for (var item in cloudHistory) {
+                 if (!localHistory.any((h) => h.toLowerCase() == item.toLowerCase())) {
+                   localHistory.add(item);
+                   changed = true;
+                 }
+               }
+               
+               if (changed) {
+                 // Re-save merged list locally
+                 if (localHistory.length > 20) localHistory.removeRange(20, localHistory.length);
+                 await prefs.setStringList('search_history', localHistory);
+                 print("🔄 Merged cloud history. Total: ${localHistory.length}");
+               }
+            }
+          }
+        } catch (e) {
+           print("⚠️ Cloud history fetch warning: $e");
+        }
+      }
+      
+      return localHistory;
     } catch (e) {
       ErrorHandler.logError(_tag, 'Failed to get history: $e');
       return [];
@@ -148,7 +204,7 @@ class ApiService {
       results.addAll(historyMatches);
 
       // 2. API Fetch with Debounce
-      if (query.length >= 3) {
+      if (query.length >= 2) {
         if (_suggestionsCache.containsKey(query)) {
           results.addAll(_suggestionsCache[query]!);
         } else {
@@ -194,7 +250,7 @@ class ApiService {
   Future<List<SearchResult>> _fetchPhotonSuggestions(String query, LatLng? location) async {
      try {
        // Photon API is excellent for autocomplete 'type-ahead'
-       String urlStr = 'https://photon.komoot.io/api/?q=${Uri.encodeComponent(query)}&limit=5';
+       String urlStr = 'https://photon.komoot.io/api/?q=${Uri.encodeComponent(query)}&limit=10&lang=en';
        
        // ADD LOCATION BIAS
        if (location != null) {
@@ -203,7 +259,7 @@ class ApiService {
 
        final url = Uri.parse(urlStr);
        
-       final response = await http.get(url).timeout(const Duration(seconds: 15));
+       final response = await http.get(url).timeout(const Duration(seconds: 5));
 
        if (response.statusCode == 200) {
          final data = json.decode(response.body) as Map<String, dynamic>;
@@ -255,7 +311,7 @@ class ApiService {
   Future<List<SearchResult>> _fetchNominatimSuggestions(String query) async {
     try {
       final url = Uri.parse(
-          'https://nominatim.openstreetmap.org/search?q=${Uri.encodeComponent(query)}&format=json&addressdetails=1&limit=5&countrycodes=in');
+          'https://nominatim.openstreetmap.org/search?q=${Uri.encodeComponent(query)}&format=json&addressdetails=1&limit=8&countrycodes=in');
  
       final response = await http.get(url, headers: _englishHeaders).timeout(
             const Duration(seconds: 20),
@@ -626,25 +682,26 @@ Future<List<RouteModel>> getSafeRoutesOptions(
   LatLng start,
   LatLng end, {
   VehicleType vehicleType = VehicleType.bike,
+  String locale = 'en', // Added Locale
 }) async {
   try {
     // 1. Ocean barrier check
     const Distance distanceCalc = Distance();
     final airDistance = distanceCalc.as(LengthUnit.Kilometer, start, end);
 
-    if (airDistance > 2000) {
-      throw Exception('Ocean/Continental barrier detected. Road route unavailable.');
+    if (airDistance > 10000) { // Increased to 10,000 km
+      throw Exception('Route too long (> 10,000 km). Please select a closer destination.');
     }
 
     // 2. MULTI-PROFILE STRATEGY: Fetch from different networks
-    List<String> profilesToFetch = ['driving'];
+    List<String> profilesToFetch = ['car'];
     
     if (vehicleType == VehicleType.bike) {
-      // Bikes can use all networks
-      profilesToFetch = ['cycling', 'driving', 'walking'];
+      // Bikes can use bike and foot networks
+      profilesToFetch = ['bike', 'car', 'foot'];
     } else if (vehicleType == VehicleType.car || vehicleType == VehicleType.truck) {
-      // Cars limited to driving
-      profilesToFetch = ['driving'];
+      // Cars limited to car profile
+      profilesToFetch = ['car'];
     }
 
     print("🚗 Fetching routes for ${vehicleType.displayName}");
@@ -653,10 +710,11 @@ Future<List<RouteModel>> getSafeRoutesOptions(
     // 3. Fetch ALL profiles in PARALLEL (faster)
     final futures = profilesToFetch.map((profile) async {
       try {
-        return await _getOsrmRoutesWithAlternatives(
+        return await _getGraphHopperRoutes(
           start,
           end,
           profile: profile,
+          locale: locale, // Pass locale
         );
       } catch (e) {
         ErrorHandler.logError(_tag, 'Failed to fetch $profile routes: $e');
@@ -673,7 +731,7 @@ Future<List<RouteModel>> getSafeRoutesOptions(
     }
 
     if (allRawRoutes.isEmpty) {
-      throw Exception('No routes found from OSRM');
+      throw Exception('Could not find a route. The distance might be too long for the server or there is no connection.');
     }
 
     print("📊 Found ${allRawRoutes.length} raw routes");
@@ -859,8 +917,8 @@ List<RouteModel> _deduplicateRoutes(List<RouteModel> routes) {
       final viaPoint = LatLng(perpLat, perpLon);
 
       // Fetch route with via point to force a detour
-      final profile = vehicleType == VehicleType.bike ? 'cycling' : 'driving';
-      final routes = await _getOsrmRoutesWithAlternatives(
+      final profile = vehicleType == VehicleType.bike ? 'bike' : 'car';
+      final routes = await _getGraphHopperRoutes(
         start,
         end,
         profile: profile,
@@ -906,8 +964,8 @@ List<RouteModel> _deduplicateRoutes(List<RouteModel> routes) {
 
       if (maxRainIntensity >= vehicleType.rainThreshold) {
         return 'High';
-      } else if (maxRainIntensity > vehicleType.rainThreshold * 0.5) {
-        return 'Medium';
+      } else {
+        return 'Medium'; // ANY rain = Caution (Orange)
       }
     }
 
@@ -921,50 +979,80 @@ List<RouteModel> _deduplicateRoutes(List<RouteModel> routes) {
     return 'Safe';
   }
 
-  /// Gets multiple route alternatives from OSRM API.
-  /// 
-  /// POLYLINE SNAP FIX: Routes use exact OSRM geometry to prevent GPS offset.
-  Future<List<RouteModel>> _getOsrmRoutesWithAlternatives(
+  /// GraphHopper API Key
+  static const String _graphHopperKey = '7df7e826-bfd0-44a5-bd6d-48c94e64b66e';
+
+  /// Gets routes from GraphHopper API.
+  ///
+  /// Supports long-distance routes (1000+ km).
+  /// Profiles: 'car', 'bike', 'foot'
+  Future<List<RouteModel>> _getGraphHopperRoutes(
     LatLng start,
     LatLng end, {
-    String profile = 'driving', // Default
-    LatLng? viaPoint, // For forced deviation
+    String profile = 'car',
+    LatLng? viaPoint,
+    String locale = 'en', // Added Locale
   }) async {
     try {
-      // Use efficient OSRM profiles
-      String coordinates = '${start.longitude},${start.latitude};${end.longitude},${end.latitude}';
-      
+      // Build point parameters (GraphHopper uses repeated 'point' params)
+      final pointParams = <String>[
+        'point=${start.latitude},${start.longitude}',
+      ];
       if (viaPoint != null) {
-        coordinates = '${start.longitude},${start.latitude};${viaPoint.longitude},${viaPoint.latitude};${end.longitude},${end.latitude}';
+        pointParams.add('point=${viaPoint.latitude},${viaPoint.longitude}');
       }
+      pointParams.add('point=${end.latitude},${end.longitude}');
 
-      final url = Uri.parse('https://router.project-osrm.org/route/v1/$profile/'
-          '$coordinates'
-          '?overview=full&geometries=geojson&alternatives=true&steps=true');
+      // Build query parameters (free plan compatible — no ch.disable)
+      final otherParams = <String>[
+        'key=$_graphHopperKey',
+        'vehicle=$profile',
+        'locale=$locale', // Use passed locale
 
-      final response = await http.get(url, headers: _englishHeaders).timeout(
-            const Duration(seconds: 8),
+        'points_encoded=false',
+        'instructions=true',
+      ];
+
+      final baseUrl = 'https://graphhopper.com/api/1/route';
+      final queryString = [...pointParams, ...otherParams].join('&');
+      final url = Uri.parse('$baseUrl?$queryString');
+
+      print('📍 [GraphHopper] Requesting: $url');
+
+      final response = await http.get(url).timeout(
+            const Duration(seconds: 20),
           );
+
+      print('📍 [GraphHopper] Status: ${response.statusCode}');
 
       if (response.statusCode == 200) {
         final data = json.decode(response.body) as Map<String, dynamic>;
-        final routes = data['routes'] as List<dynamic>? ?? [];
+        final paths = data['paths'] as List<dynamic>? ?? [];
 
-        if (routes.isEmpty) {
+        if (paths.isEmpty) {
           throw Exception('No routes found');
         }
 
-        final List<RouteModel> parsedRoutes = routes
-            .map((route) =>
-                RouteModel.fromOsrmJson(route as Map<String, dynamic>))
+        print('📍 [GraphHopper] Found ${paths.length} path(s)');
+
+        final List<RouteModel> parsedRoutes = paths
+            .map((path) =>
+                RouteModel.fromGraphHopperJson(path as Map<String, dynamic>))
             .toList();
 
         return parsedRoutes;
       } else {
-        throw Exception('OSRM returned status ${response.statusCode}');
+        // Parse error message from GraphHopper
+        String errorMsg = 'GraphHopper returned status ${response.statusCode}';
+        try {
+          final errData = json.decode(response.body) as Map<String, dynamic>;
+          errorMsg = errData['message'] as String? ?? errorMsg;
+          print('❌ [GraphHopper] Error: $errorMsg');
+        } catch (_) {}
+        throw Exception(errorMsg);
       }
     } catch (e) {
-      ErrorHandler.logError(_tag, '_getOsrmRoutesWithAlternatives error: $e');
+      ErrorHandler.logError(_tag, '_getGraphHopperRoutes error: $e');
       rethrow;
     }
   }
@@ -975,7 +1063,11 @@ List<RouteModel> _deduplicateRoutes(List<RouteModel> routes) {
     VehicleType vehicleType,
   ) async {
     try {
-      final checkPoints = _sampleRoutePoints(route.points, samples: 4); // Fast sample
+      // DYNAMIC SAMPLING: 1 sample every 50km, min 10, max 40
+      final double distanceKm = route.distanceMeters / 1000;
+      final int dynamicSamples = (distanceKm / 50).round().clamp(10, 40);
+      
+      final checkPoints = _sampleRoutePoints(route.points, samples: dynamicSamples);
       var rainDetected = false;
       final List<WeatherAlert> weatherAlerts = [];
       final now = DateTime.now();
@@ -992,8 +1084,9 @@ List<RouteModel> _deduplicateRoutes(List<RouteModel> routes) {
         if (weather != null) {
           final code = weather['weathercode'] as int? ?? 0;
           final rainIntensity = weather['rain'] as double? ?? 0.0;
+          print("DEBUG: Weather at point $i: Code $code, Rain $rainIntensity mm");
 
-          if (_isRainyCode(code)) {
+          if (_isRainyCode(code) || rainIntensity > 0.1) { // More sensitive check
             rainDetected = true;
             weatherAlerts.add(
               WeatherAlert(
@@ -1061,7 +1154,7 @@ List<RouteModel> _deduplicateRoutes(List<RouteModel> routes) {
       await Future.delayed(const Duration(milliseconds: 150));
 
       final url = Uri.parse(
-          'https://api.open-meteo.com/v1/forecast?latitude=${point.latitude}&longitude=${point.longitude}&hourly=weathercode,temperature_2m,rain&timezone=auto');
+          'https://api.open-meteo.com/v1/forecast?latitude=${point.latitude}&longitude=${point.longitude}&current_weather=true&hourly=weathercode,temperature_2m,rain&timezone=auto');
 
       final response = await http.get(url, headers: _englishHeaders).timeout(
             const Duration(seconds: 10),
@@ -1069,33 +1162,72 @@ List<RouteModel> _deduplicateRoutes(List<RouteModel> routes) {
 
       if (response.statusCode == 200) {
         final data = json.decode(response.body) as Map<String, dynamic>;
+        
+        // 1. Check Current Weather first (Most accurate for "Now")
+        final current = data['current_weather'];
+        final isCurrentHour = time.difference(DateTime.now()).inMinutes.abs() < 60;
+
+        if (isCurrentHour && current != null) {
+             // Open-Meteo current_weather doesn't give 'rain' volume, but gives code.
+             // We can use the code, and map it to a rough intensity or use hourly for volume.
+             final code = current['weathercode'] as int;
+             final temp = current['temperature'] as double;
+             // Only return if it indicates rain, otherwise check hourly for forecast
+             /* We can combine: Use current code/temp, but look at hourly for rain volume */
+        }
+
         final times = (data['hourly'] as Map<String, dynamic>?)?['time']
                 as List<dynamic>? ??
             [];
-        var targetIndex = 0;
+        final rains = (data['hourly'] as Map<String, dynamic>?)?['rain'] as List<dynamic>? ?? [];
+        final temps = (data['hourly'] as Map<String, dynamic>?)?['temperature_2m'] as List<dynamic>? ?? [];
+        final codes = (data['hourly'] as Map<String, dynamic>?)?['weathercode'] as List<dynamic>? ?? [];
 
         final targetIso = time.toIso8601String().substring(0, 13);
 
         for (int i = 0; i < times.length; i++) {
           if (times[i].toString().startsWith(targetIso)) {
-            targetIndex = i;
-            break;
+              // Found exact hourly slot
+              final rain = (rains[i] as num?)?.toDouble() ?? 0.0;
+              final code = (codes[i] as num?)?.toInt() ?? 0;
+              final temp = (temps[i] as num?)?.toDouble() ?? 0.0;
+              
+              // If current weather says raining but hourly says 0, trust current weather code
+              var finalRain = rain;
+              var finalCode = code;
+              
+              if (isCurrentHour && current != null) {
+                  final curCode = current['weathercode'] as int;
+                  // If hourly says 0 rain but current says 3mm equivalent code, trust current?
+                  // Actually, current_weather doesn't have mm. 
+                  // But if hourly has 0mm, we might be missing it.
+                  if (_isRainyCode(curCode) && finalRain == 0) {
+                      finalRain = 0.5; // Minimal detection fallback
+                      finalCode = curCode;
+                  }
+              }
+
+              final result = {
+                'weathercode': finalCode,
+                'temperature_2m': temp,
+                'rain': finalRain,
+              };
+              _weatherCache[key] = result;
+              return result;
           }
         }
+        // Fallback: If no exact hour match, use index 0
+        if (times.isNotEmpty) {
+           final result = {
+                'weathercode': (codes[0] as num?)?.toInt() ?? 0,
+                'temperature_2m': (temps[0] as num?)?.toDouble() ?? 0.0,
+                'rain': (rains[0] as num?)?.toDouble() ?? 0.0,
+           };
+           _weatherCache[key] = result;
+           return result;
+        }
 
-        final hourly = data['hourly'] as Map<String, dynamic>?;
-        final result = <String, dynamic>{
-          'weathercode':
-              ((hourly?['weathercode'] as List<dynamic>?)?[targetIndex] ?? 0)
-                  as int,
-          'temperature_2m':
-              ((hourly?['temperature_2m'] as List<dynamic>?)?[targetIndex] ??
-                  0.0) as double,
-          'rain': ((hourly?['rain'] as List<dynamic>?)?[targetIndex] ?? 0.0) as double,
-        };
 
-        _weatherCache[key] = result;
-        return result;
       }
     } catch (e) {
       ErrorHandler.logError(_tag, 'Weather forecast error: $e');

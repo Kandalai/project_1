@@ -1,0 +1,277 @@
+﻿
+lib\screens\home_scre
+en.dart:16:  const Ho
+meScreen({super.key})
+;
+lib\screens\home_scre
+en.dart:44:      
+duration: const Durat
+ion(milliseconds: 
+1500),
+lib\screens\home_scre
+en.dart:122:    
+_debounce = 
+Timer(const Duration(
+milliseconds: 500), 
+() async {
+lib\screens\home_scre
+en.dart:160:      
+backgroundColor: 
+const 
+Color(0xFF0F172A), 
+// Fallback
+lib\screens\home_scre
+en.dart:165:         
+   decoration: const 
+BoxDecoration(
+lib\screens\home_scre
+en.dart:178:         
+   child: _buildGlowC
+ircle(const 
+Color(0xFF00F0FF), 
+400), // Cyan Glow 
+(Top Right)
+lib\screens\home_scre
+en.dart:183:         
+   child: _buildGlowC
+ircle(const 
+Color(0xFF7000FF), 
+350), // Purple Glow 
+(Bottom Left)
+lib\screens\home_scre
+en.dart:191:         
+       padding: 
+const EdgeInsets.symm
+etric(horizontal: 
+24.0, vertical: 
+16.0),
+lib\screens\home_scre
+en.dart:197:         
+           const 
+SizedBox(height: 32),
+lib\screens\home_scre
+en.dart:201:         
+           const 
+SizedBox(height: 32),
+lib\screens\home_scre
+en.dart:205:         
+           const 
+SizedBox(height: 32),
+lib\screens\home_scre
+en.dart:217:         
+           const 
+SizedBox(height: 16),
+lib\screens\home_scre
+en.dart:221:         
+           const 
+SizedBox(height: 32),
+lib\screens\home_scre
+en.dart:243:         
+           color: 
+const Color(0xFF0F172
+A).withValues(alpha: 
+0.95),
+lib\screens\home_scre
+en.dart:245:         
+             
+padding: const 
+EdgeInsets.all(0),
+lib\screens\home_scre
+en.dart:251:         
+                 
+leading: const Icon(I
+cons.location_on, 
+color: 
+Color(0xFF00F0FF)),
+lib\screens\home_scre
+en.dart:254:         
+                    
+style: const 
+TextStyle(color: 
+Colors.white, 
+fontWeight: 
+FontWeight.bold),
+lib\screens\home_scre
+en.dart:311:         
+   const 
+SizedBox(height: 4),
+lib\screens\home_scre
+en.dart:314:         
+     style: const 
+TextStyle(
+lib\screens\home_scre
+en.dart:327:         
+     MaterialPageRout
+e(builder: (context) 
+=> const 
+SettingsScreen())
+lib\screens\home_scre
+en.dart:338:         
+     image: const 
+DecorationImage(
+lib\screens\home_scre
+en.dart:360:         
+   offset: const 
+Offset(0, 10),
+lib\screens\home_scre
+en.dart:364:      
+padding: const EdgeIn
+sets.symmetric(horizo
+ntal: 16),
+lib\screens\home_scre
+en.dart:367:         
+ const 
+Icon(Icons.search, 
+color: 
+Colors.white54),
+lib\screens\home_scre
+en.dart:368:         
+ const 
+SizedBox(width: 12),
+lib\screens\home_scre
+en.dart:372:         
+     style: const 
+TextStyle(color: 
+Colors.white),
+lib\screens\home_scre
+en.dart:381:         
+   padding: const 
+EdgeInsets.all(8),
+lib\screens\home_scre
+en.dart:383:         
+     color: const Col
+or(0xFF00F0FF).withVa
+lues(alpha: 0.1),
+lib\screens\home_scre
+en.dart:386:         
+   child: const 
+Icon(Icons.mic, 
+color: 
+Color(0xFF00F0FF), 
+size: 20),
+lib\screens\home_scre
+en.dart:395:       
+return const 
+Center(child: Circula
+rProgressIndicator(co
+lor: 
+Color(0xFF00F0FF)));
+lib\screens\home_scre
+en.dart:408:         
+ padding: const 
+EdgeInsets.all(24),
+lib\screens\home_scre
+en.dart:410:         
+   color: const Color
+(0xFF1E293B).withValu
+es(alpha: 0.6),
+lib\screens\home_scre
+en.dart:440:         
+             const 
+SizedBox(height: 8),
+lib\screens\home_scre
+en.dart:443:         
+               
+style: const 
+TextStyle(
+lib\screens\home_scre
+en.dart:453:         
+           style: 
+const TextStyle(
+lib\screens\home_scre
+en.dart:462:         
+        const 
+SizedBox(height: 24),
+lib\screens\home_scre
+en.dart:464:         
+        _buildAlertPi
+ll("Potential 
+Slippery Roads", 
+const 
+Color(0xFFFF9500)),
+lib\screens\home_scre
+en.dart:476:      
+padding: const EdgeIn
+sets.symmetric(vertic
+al: 12, horizontal: 
+16),
+lib\screens\home_scre
+en.dart:485:         
+ const 
+SizedBox(width: 12),
+lib\screens\home_scre
+en.dart:502:        
+return const 
+Center(child: 
+Text("No recent 
+searches", style: 
+TextStyle(color: 
+Colors.white38)));
+lib\screens\home_scre
+en.dart:509:        
+padding: const EdgeIn
+sets.symmetric(horizo
+ntal: 0),
+lib\screens\home_scre
+en.dart:512:        
+separatorBuilder: 
+(ctx, i) => const 
+SizedBox(width: 16),
+lib\screens\home_scre
+en.dart:527:      
+padding: const 
+EdgeInsets.all(16),
+lib\screens\home_scre
+en.dart:529:        
+color: const Color(0x
+FF1E293B).withValues(
+alpha: 0.5),
+lib\screens\home_scre
+en.dart:532:         
+    color: isSafe ? 
+const Color(0xFF00FF9
+D).withValues(alpha: 
+0.3) : Colors.white10
+lib\screens\home_scre
+en.dart:536:         
+    color: const Colo
+r(0xFF00FF9D).withVal
+ues(alpha: 0.1),
+lib\screens\home_scre
+en.dart:551:         
+        const Icon(Ic
+ons.check_circle, 
+color: 
+Color(0xFF00FF9D), 
+size: 16),
+lib\screens\home_scre
+en.dart:559:         
+       style: const 
+TextStyle(color: 
+Colors.white, 
+fontWeight: 
+FontWeight.bold),
+lib\screens\home_scre
+en.dart:563:         
+     const 
+SizedBox(height: 4),
+lib\screens\home_scre
+en.dart:584:         
+ shadowColor: const C
+olor(0xFF00F0FF).with
+Values(alpha: 0.4),
+lib\screens\home_scre
+en.dart:590:         
+     pageBuilder: 
+(context, animation, 
+secondaryAnimation) 
+=> const MapScreen(
+lib\screens\home_scre
+en.dart:602:         
+   gradient: const 
+LinearGradient(
+lib\screens\home_scre
+en.dart:611:         
+   child: const Row(
+
+

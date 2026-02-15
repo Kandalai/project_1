@@ -32,7 +32,7 @@ class PremiumBottomSheet extends StatelessWidget {
       child: BackdropFilter(
         filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
         child: Container(
-          padding: const EdgeInsets.fromLTRB(14, 8, 14, 12),
+          padding: const EdgeInsets.fromLTRB(12, 6, 12, 8), // Reduced padding
           decoration: BoxDecoration(
             gradient: LinearGradient(
               begin: Alignment.topLeft,
@@ -67,7 +67,7 @@ class PremiumBottomSheet extends StatelessWidget {
               Container(
                 width: 32,
                 height: 3,
-                margin: const EdgeInsets.only(bottom: 8),
+                margin: const EdgeInsets.only(bottom: 6), // Reduced margin
                 decoration: BoxDecoration(
                   color: Colors.white.withValues(alpha: 0.2),
                   borderRadius: BorderRadius.circular(2),
@@ -80,7 +80,7 @@ class PremiumBottomSheet extends StatelessWidget {
                 
                 // ROW 2: AI Alert (only if needed, compact)
                 if (route!.isRaining || route!.hydroplaningRisk || route!.elevationDips.isNotEmpty) ...[
-                  const SizedBox(height: 8),
+                  const SizedBox(height: 6), // Reduced spacing
                   _buildCompactAlert(),
                 ],
               ] else
@@ -103,9 +103,9 @@ class PremiumBottomSheet extends StatelessWidget {
         _SafetyScoreRing(
           percentage: safetyPercent,
           color: riskColor,
-          size: 40,
+          size: 36, // Reduced size (40 -> 36)
         ),
-        const SizedBox(width: 10),
+        const SizedBox(width: 8), // Reduced gap
 
         // Status text
         Expanded(
@@ -118,23 +118,23 @@ class PremiumBottomSheet extends StatelessWidget {
                 style: const TextStyle(
                   color: Colors.white,
                   fontWeight: FontWeight.bold,
-                  fontSize: 13,
+                  fontSize: 12, // Reduced font
                 ),
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
               ),
-              const SizedBox(height: 3),
+              const SizedBox(height: 2),
               Row(
                 children: [
                   _buildRiskChip(route!.riskLevel, riskColor),
-                  const SizedBox(width: 6),
+                  const SizedBox(width: 4),
                   if (weatherForecast.isNotEmpty)
                     Flexible(
                       child: Text(
                         weatherForecast,
                         style: TextStyle(
                           color: Colors.white.withValues(alpha: 0.4),
-                          fontSize: 10,
+                          fontSize: 9, // Reduced font
                         ),
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
@@ -145,7 +145,7 @@ class PremiumBottomSheet extends StatelessWidget {
             ],
           ),
         ),
-        const SizedBox(width: 8),
+        const SizedBox(width: 6), // Reduced gap
 
         // Inline stat chips
         Expanded(
@@ -153,11 +153,11 @@ class PremiumBottomSheet extends StatelessWidget {
           child: Row(
             children: [
               _buildMiniStat(Icons.schedule, "${route!.durationMinutes}", "min", const Color(0xFF00F0FF)),
-              const SizedBox(width: 6),
+              const SizedBox(width: 4),
               _buildMiniStat(Icons.straighten, (route!.distanceMeters / 1000).toStringAsFixed(1), "km", const Color(0xFF7C3AED)),
-              const SizedBox(width: 6),
+              const SizedBox(width: 4),
               _buildMiniStat(Icons.shield, "${safetyPercent.toInt()}", "%", riskColor),
-              const SizedBox(width: 6),
+              const SizedBox(width: 4),
               _buildMiniStat(
                 Icons.water_drop,
                 route!.isRaining ? "WET" : "DRY",
@@ -174,22 +174,22 @@ class PremiumBottomSheet extends StatelessWidget {
   Widget _buildMiniStat(IconData icon, String value, String unit, Color color) {
     return Expanded(
       child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 6),
+        padding: const EdgeInsets.symmetric(vertical: 4), // Reduced padding
         decoration: BoxDecoration(
           color: color.withValues(alpha: 0.08),
-          borderRadius: BorderRadius.circular(10),
+          borderRadius: BorderRadius.circular(8),
           border: Border.all(color: color.withValues(alpha: 0.12)),
         ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(icon, color: color, size: 12),
-            const SizedBox(height: 2),
+            Icon(icon, color: color, size: 10), // Reduced icon size
+            const SizedBox(height: 1),
             Text(
               unit.isNotEmpty ? "$value$unit" : value,
               style: TextStyle(
                 color: Colors.white,
-                fontSize: 10,
+                fontSize: 9, // Reduced font
                 fontWeight: FontWeight.bold,
               ),
               maxLines: 1,

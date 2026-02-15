@@ -343,6 +343,78 @@ class RouteModel {
     );
   }
 
+  /// Create from GraphHopper API response (single path object).
+  factory RouteModel.fromGraphHopperJson(Map<String, dynamic> json) {
+    // Points: { "type":"LineString", "coordinates":[[lon,lat],...] }
+    final pointsData = json['points'] as Map<String, dynamic>?;
+    final coordinates = (pointsData?['coordinates'] as List<dynamic>?) ?? [];
+
+    final points = coordinates
+        .map((coord) {
+          final coordList = coord as List<dynamic>;
+          return LatLng(
+            (coordList[1] as num).toDouble(), // lat
+            (coordList[0] as num).toDouble(), // lon
+          );
+        })
+        .toList();
+
+    // Instructions → RouteSteps
+    final instructions = (json['instructions'] as List<dynamic>?) ?? [];
+    final allSteps = <RouteStep>[];
+    for (final inst in instructions) {
+      final instMap = inst as Map<String, dynamic>;
+      final interval = (instMap['interval'] as List<dynamic>?) ?? [0, 0];
+      // Get location from the first point index of this instruction
+      final startIdx = (interval[0] as num).toInt();
+      List<double> loc = [0.0, 0.0];
+      if (startIdx < points.length) {
+        loc = [points[startIdx].longitude, points[startIdx].latitude];
+      }
+      allSteps.add(RouteStep(
+        instruction: (instMap['text'] as String?) ?? '',
+        distance: (instMap['distance'] as num?)?.toDouble() ?? 0.0,
+        maneuverType: _ghSignToType((instMap['sign'] as num?)?.toInt() ?? 0),
+        location: loc,
+      ));
+    }
+
+    final distance = (json['distance'] as num?)?.toDouble() ?? 0.0;
+    final timeMs = (json['time'] as num?)?.toDouble() ?? 0.0;
+    final durationSec = timeMs / 1000;
+
+    return RouteModel(
+      points: points,
+      steps: allSteps,
+      weatherAlerts: [],
+      elevationDips: [],
+      distanceMeters: distance,
+      durationMinutes: (durationSec / 60).round(),
+      durationSeconds: durationSec.round(),
+      riskLevel: 'Unknown',
+      isRaining: false,
+      hydroplaningRisk: false,
+      hasUnpavedRoads: false,
+    );
+  }
+
+  /// Maps GraphHopper sign codes to human-readable maneuver types.
+  static String _ghSignToType(int sign) {
+    switch (sign) {
+      case -3: return 'sharp_left';
+      case -2: return 'left';
+      case -1: return 'slight_left';
+      case 0:  return 'continue';
+      case 1:  return 'slight_right';
+      case 2:  return 'right';
+      case 3:  return 'sharp_right';
+      case 4:  return 'arrive';
+      case 5:  return 'via_reached';
+      case 6:  return 'roundabout';
+      default: return 'continue';
+    }
+  }
+
   /// Copy with weather analysis results.
   RouteModel copyWithWeather({
     bool? isRaining,

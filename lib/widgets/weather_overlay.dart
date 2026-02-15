@@ -59,12 +59,8 @@ class _WeatherOverlayState extends State<WeatherOverlay> with SingleTickerProvid
       }
     }
     
-    if (widget.weatherMode == 'cloudy' || widget.weatherMode == 'storm') {
-        int cloudCount = widget.weatherMode == 'storm' ? 5 : 3;
-        for (int i = 0; i < cloudCount; i++) {
-          _clouds.add(_createCloud());
-        }
-    }
+    // CLOUDS REMOVED PER USER REQUEST
+    // if (widget.weatherMode == 'cloudy' || widget.weatherMode == 'storm') { ... }
   }
 
   _Particle _createRainDrop([bool randomizeY = true]) {
@@ -73,7 +69,7 @@ class _WeatherOverlayState extends State<WeatherOverlay> with SingleTickerProvid
       y: randomizeY ? _random.nextDouble() : -0.1,
       speed: 0.015 + _random.nextDouble() * 0.02, // Fast fall
       length: 0.02 + _random.nextDouble() * 0.03,
-      opacity: 0.3 + _random.nextDouble() * 0.4,
+      opacity: 0.05 + _random.nextDouble() * 0.15, // Max 0.2 (was 0.3)
     );
   }
 
@@ -108,13 +104,10 @@ class _WeatherOverlayState extends State<WeatherOverlay> with SingleTickerProvid
           
           return Stack(
             children: [
-              // TINT LAYER
-              if (widget.weatherMode == 'cloudy')
-                Container(color: Colors.grey.withValues(alpha: 0.1)),
-              if (widget.weatherMode == 'rain')
-                Container(color: Colors.blueGrey.withValues(alpha: 0.15)),
-              if (widget.weatherMode == 'storm')
-                Container(color: Colors.black.withValues(alpha: 0.3)),
+              // TINT LAYER REMOVED for clarity
+              // if (widget.weatherMode == 'cloudy') ...
+              // if (widget.weatherMode == 'rain') ...
+              // if (widget.weatherMode == 'storm') ...
 
               // PARTICLES & CLOUDS
               CustomPaint(
@@ -200,32 +193,14 @@ class _WeatherPainter extends CustomPainter {
       );
     }
 
-    // 2. DRAW CLOUDS
-    // Drawing fluffy clouds procedurally is expensive, so we use simple soft circles/ovals
-    // or we could use an asset image. For pure code, we'll draw soft gradients.
-    for (var c in clouds) {
-      final paint = Paint()
-        ..color = (mode == 'storm' ? Colors.black : Colors.white)
-            .withValues(alpha: c.opacity)
-        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 30); // Heavy blur for "fog" look
-
-      final center = Offset(c.x * size.width, c.y * size.height);
-      final cloudSize = size.width * 0.4 * c.scale;
-      
-      canvas.drawCircle(center, cloudSize, paint);
-      // Draw a second circle for shape irregularity
-      canvas.drawCircle(
-          center + Offset(cloudSize * 0.6, cloudSize * 0.2), 
-          cloudSize * 0.8, 
-          paint
-      );
-    }
+    // 2. DRAW CLOUDS (DISABLED)
+    // for (var c in clouds) { ... }
 
     // 3. DRAW RAIN
     if (mode == 'rain' || mode == 'storm') {
       final paint = Paint()
-        ..color = Colors.white.withValues(alpha: 0.6)
-        ..strokeWidth = 1.5
+        ..color = Colors.white.withValues(alpha: 0.25) // Reduced from 0.4
+        ..strokeWidth = 0.5 // Reduced from 1.0 (Hairline)
         ..strokeCap = StrokeCap.round;
 
       for (var p in particles) {

@@ -7,8 +7,9 @@ pluginManagement {
                 properties.load(stream)
             }
         }
-        properties.getProperty("flutter.sdk")
-    } ?: throw GradleException("flutter.sdk not set in local.properties")
+        val path = properties.getProperty("flutter.sdk")
+        if (path != null) path.replace("\\", "/") else throw GradleException("flutter.sdk not set in local.properties")
+    }
 
     includeBuild("$flutterSdkPath/packages/flutter_tools/gradle")
 
@@ -24,6 +25,7 @@ plugins {
     id("com.android.application") version "8.6.0" apply false
     id("org.jetbrains.kotlin.android") version "2.1.0" apply false
     id("com.android.library") version "8.6.0" apply false
+    id("com.google.gms.google-services") version "4.4.2" apply false
 }
 
 include(":app")
